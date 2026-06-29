@@ -1,0 +1,22 @@
+# R session and editor artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# Local raw single-cell data and large generated outputs
+胆囊癌/
+gallbladder_cancer/
+results/**/*.rds
+results/**/*.h5ad
+results/**/*.h5seurat
+results/**/*.pdf
+results/**/*.png
+results/**/*.html
+
+# Logs and temporary files
+logs/
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
