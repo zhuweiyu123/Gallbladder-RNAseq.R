@@ -2,9 +2,9 @@
 # tissue2 STK31-NK 完整分析脚本
 # ============================================================
 # 用途：胆囊癌 tissue2 单细胞数据，聚焦 STK31
-#   [1] 定位 STK31 高表达细胞群
+#   [1] Locate STK31-high tumor epithelial cells
 #   [2] 鉴定 NK 细胞候选群（NK marker score）
-#   [3] 差异分析（STK31-high vs NK、vs all，NK vs all）
+#   [3] DE: epithelial STK31 high vs low, STK31-high tumor epithelial vs NK/all, NK vs all
 #   [4] 候选 ligand-receptor 互作初筛
 #   [5] 细胞身份验证（身份 marker DotPlot / UMAP）
 #   [6] NK 功能模块评分（细胞毒/活化/耗竭/迁移/TGF-beta）
@@ -35,6 +35,8 @@ dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 target_gene <- "STK31"
 min_pct_for_stk31_cluster <- 0.01
 top_stk31_quantile <- 0.75
+tumor_epithelial_celltype_label <- "Epithelial"
+tumor_epithelial_stk31_high_quantile <- 0.75
 run_exact_wilcox <- TRUE
 
 # 手动指定 NK cluster（留空则自动按 NK marker score 筛选）
@@ -60,7 +62,7 @@ broad_celltype_markers <- list(
   Mast_cell = c("TPSAB1", "TPSB2", "CPA3", "KIT")
 )
 
-# 候选 ligand-receptor 参考表：用于 STK31-high 与 NK 之间的通讯初筛
+# Candidate ligand-receptor table for STK31-high tumor epithelial <-> NK screening
 lr_reference <- data.frame(
   ligand = c(
     "CXCL9", "CXCL10", "CXCL11", "CCL5", "XCL1", "XCL2", "IL15", "IL18",
@@ -197,7 +199,7 @@ score_broad_celltypes <- function(object, marker_list) {
   list(long = scores, best = best[order(as.numeric(as.character(best$cluster))), ])
 }
 
-# 按分位数自动筛选 STK31 高表达 cluster
+# QC only: legacy cluster-level STK31 expression screening
 
 choose_stk31_clusters <- function(summary_table) {
   cutoff <- as.numeric(stats::quantile(summary_table$avg_expr, top_stk31_quantile, na.rm = TRUE))
@@ -308,29 +310,60 @@ average_expression_for_genes <- function(object, cells, genes) {
 
 # 基于表达量推断候选 ligand-receptor 互作
 
-infer_lr_links <- function(object, stk31_cells, nk_cells, lr_table) {
+assign_tumor_epithelial_stk31_group <- function(object, stk31_expr, celltype_label, high_quantile = 0.75) {
+  tumor_epithelial_idx <- as.character(object$manual_celltype) == celltype_label
+  if (sum(tumor_epithelial_idx) == 0) {
+    stop("No tumor epithelial cells found with manual_celltype == ", celltype_label)
+  }
+
+  tumor_epithelial_expr <- stk31_expr[tumor_epithelial_idx]
+  cutoff <- as.numeric(stats::quantile(tumor_epithelial_expr, high_quantile, na.rm = TRUE))
+  if (!is.finite(cutoff)) cutoff <- 0
+
+  if (cutoff > 0) {
+    high_idx <- tumor_epithelial_idx & stk31_expr >= cutoff
+  } else {
+    high_idx <- tumor_epithelial_idx & stk31_expr > 0
+  }
+  low_idx <- tumor_epithelial_idx & !high_idx
+
+  group <- rep("Other", length(stk31_expr))
+  group[high_idx] <- "STK31_high_tumor_epithelial"
+  group[low_idx] <- "STK31_low_tumor_epithelial"
+  names(group) <- colnames(object)
+
+  list(
+    group = group,
+    cutoff = cutoff,
+    tumor_epithelial_cells = sum(tumor_epithelial_idx),
+    high_cells = sum(high_idx),
+    low_cells = sum(low_idx)
+  )
+}
+
+infer_lr_links <- function(object, tumor_epithelial_stk31_high_cells, nk_cells, lr_table) {
   lr_genes <- unique(c(lr_table$ligand, lr_table$receptor))
 # --- STK31 阳性细胞分布 ---
-  stk31_expr <- average_expression_for_genes(object, stk31_cells, lr_genes)
+  tumor_epithelial_high_expr <- average_expression_for_genes(object, tumor_epithelial_stk31_high_cells, lr_genes)
   nk_expr <- average_expression_for_genes(object, nk_cells, lr_genes)
-  names(stk31_expr)[names(stk31_expr) != "gene"] <- paste0("stk31_group_", names(stk31_expr)[names(stk31_expr) != "gene"])
+  names(tumor_epithelial_high_expr)[names(tumor_epithelial_high_expr) != "gene"] <- paste0("tumor_epithelial_stk31_high_", names(tumor_epithelial_high_expr)[names(tumor_epithelial_high_expr) != "gene"])
   names(nk_expr)[names(nk_expr) != "gene"] <- paste0("nk_group_", names(nk_expr)[names(nk_expr) != "gene"])
 
-  forward <- merge(lr_table, stk31_expr, by.x = "ligand", by.y = "gene", all.x = TRUE)
+  forward <- merge(lr_table, tumor_epithelial_high_expr, by.x = "ligand", by.y = "gene", all.x = TRUE)
   forward <- merge(forward, nk_expr, by.x = "receptor", by.y = "gene", all.x = TRUE)
-  forward$direction <- "STK31_high_cell_to_NK_cell"
+  forward$direction <- "STK31_high_tumor_epithelial_to_NK_cell"
 
   reverse <- merge(lr_table, nk_expr, by.x = "ligand", by.y = "gene", all.x = TRUE)
-  reverse <- merge(reverse, stk31_expr, by.x = "receptor", by.y = "gene", all.x = TRUE)
+  reverse <- merge(reverse, tumor_epithelial_high_expr, by.x = "receptor", by.y = "gene", all.x = TRUE)
 
-  reverse$direction <- "NK_cell_to_STK31_high_cell"
+  reverse$direction <- "NK_cell_to_STK31_high_tumor_epithelial"
   reverse <- reverse[, names(forward)]
 
   links <- rbind(forward, reverse)
   links[is.na(links)] <- 0
-  links$interaction_score <- sqrt(links$stk31_group_avg_expr * links$nk_group_avg_expr)
+  links$interaction_score <- sqrt(links$tumor_epithelial_stk31_high_avg_expr * links$nk_group_avg_expr)
 
-  links <- links[order(-links$interaction_score, -links$stk31_group_pct_expr, -links$nk_group_pct_expr), ]
+  links <- links[order(-links$interaction_score, -links$tumor_epithelial_stk31_high_pct_expr, -links$nk_group_pct_expr), ]
   links
 }
 
@@ -397,7 +430,7 @@ message("Summarizing STK31 expression by cluster")
 # ---------- 主分析开始 ----------
 stk31_cluster_summary <- summarize_gene_by_cluster(obj, target_gene)
 write.csv(stk31_cluster_summary, file.path(out_dir, "stk31_expression_by_cluster.csv"), row.names = FALSE)
-stk31_high_clusters <- choose_stk31_clusters(stk31_cluster_summary)
+legacy_stk31_high_clusters_qc_only <- choose_stk31_clusters(stk31_cluster_summary)
 
 # ---------- 验证扩展配置 ----------
 
@@ -518,12 +551,14 @@ broad_scores <- score_broad_celltypes(obj, broad_celltype_markers)
 write.csv(broad_scores$long, file.path(out_dir, "broad_celltype_scores_by_cluster.csv"), row.names = FALSE)
 write.csv(broad_scores$best, file.path(out_dir, "broad_celltype_best_guess_by_cluster.csv"), row.names = FALSE)
 
+cluster_to_celltype <- setNames(as.character(broad_scores$best$cell_type), as.character(broad_scores$best$cluster))
 obj$broad_celltype <- unname(cluster_to_celltype[as.character(obj$seurat_clusters)])
 obj$broad_celltype[is.na(obj$broad_celltype)] <- "Unassigned"
 obj$broad_celltype <- as.factor(obj$broad_celltype)
 
 # 将自动注释和手动 NK 注释写回对象
 
+obj$manual_celltype <- as.character(obj$broad_celltype)
 obj$manual_celltype[as.character(obj$seurat_clusters) %in% nk_clusters] <- "NK_cell"
 # 将自动注释和手动 NK 注释写回对象
 obj$manual_celltype <- as.factor(obj$manual_celltype)
@@ -542,25 +577,49 @@ cluster_celltype_annotation <- cluster_celltype_annotation[order(as.numeric(clus
 write.csv(cluster_celltype_annotation, file.path(out_dir, "cluster_celltype_annotation.csv"), row.names = FALSE)
 write.csv(cluster_celltype_annotation, file.path(out_dir, "manual_celltype_annotation.csv"), row.names = FALSE)
 
-# --- 定义分析用分组（STK31-high / NK_cell / Other）---
+# --- Define analysis groups: STK31-high/low tumor epithelial, NK_cell, Other ---
 
-obj$stk31_group <- ifelse(as.character(obj$seurat_clusters) %in% stk31_high_clusters, "STK31_high_cluster", "Other")
+stk31_expr <- as.numeric(fetch_gene_matrix(obj, target_gene)[target_gene, ])
+tumor_epithelial_assignment <- assign_tumor_epithelial_stk31_group(
+  obj,
+  stk31_expr,
+  celltype_label = tumor_epithelial_celltype_label,
+  high_quantile = tumor_epithelial_stk31_high_quantile
+)
+obj$tumor_epithelial_stk31_group <- tumor_epithelial_assignment$group
+obj$stk31_group <- obj$tumor_epithelial_stk31_group
 obj$nk_group <- ifelse(as.character(obj$seurat_clusters) %in% nk_clusters, "NK_cell", "Other")
 obj$relationship_group <- ifelse(
-# --- 定义分析用分组（STK31-high / NK_cell / Other）---
-  obj$stk31_group == "STK31_high_cluster", "STK31_high_cluster",
-  ifelse(obj$nk_group == "NK_cell", "NK_cell", "Other")
+# --- Define analysis groups: STK31-high/low tumor epithelial, NK_cell, Other ---
+  obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial", "STK31_high_tumor_epithelial",
+  ifelse(
+    obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial", "STK31_low_tumor_epithelial",
+    ifelse(obj$nk_group == "NK_cell", "NK_cell", "Other")
+  )
 )
+obj$relationship_group <- factor(
+  obj$relationship_group,
+  levels = c("STK31_high_tumor_epithelial", "STK31_low_tumor_epithelial", "NK_cell", "Other")
+)
+obj$manual_celltype_stk31_tumor_epithelial_split <- as.character(obj$manual_celltype)
+obj$manual_celltype_stk31_tumor_epithelial_split[
+  obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"
+] <- "STK31_high_tumor_epithelial"
+obj$manual_celltype_stk31_tumor_epithelial_split[
+  obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"
+] <- "STK31_low_tumor_epithelial"
+obj$manual_celltype_stk31_tumor_epithelial_split <- factor(obj$manual_celltype_stk31_tumor_epithelial_split)
 
-stk31_cells <- colnames(obj)[obj$stk31_group == "STK31_high_cluster"]
+tumor_epithelial_stk31_high_cells <- colnames(obj)[obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"]
+tumor_epithelial_stk31_low_cells <- colnames(obj)[obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"]
 nk_cells <- colnames(obj)[obj$nk_group == "NK_cell"]
-if (length(stk31_cells) == 0) stop("No STK31 high cells found. Check stk31_high_clusters.")
+if (length(tumor_epithelial_stk31_high_cells) == 0) stop("No STK31-high tumor epithelial cells found.")
+if (length(tumor_epithelial_stk31_low_cells) == 0) stop("No STK31-low tumor epithelial cells found.")
 if (length(nk_cells) == 0) stop("No NK cells found. Check nk_clusters.")
 other_cells <- colnames(obj)[obj$relationship_group == "Other"]
 
 # --- STK31 阳性细胞分布 ---
 
-stk31_expr <- as.numeric(fetch_gene_matrix(obj, target_gene)[target_gene, ])
 stk31_positive_distribution <- as.data.frame(table(obj$seurat_clusters[stk31_expr > 0]))
 colnames(stk31_positive_distribution) <- c("cluster", "stk31_positive_cells")
 stk31_positive_distribution$pct_of_all_stk31_positive <- stk31_positive_distribution$stk31_positive_cells / sum(stk31_positive_distribution$stk31_positive_cells)
@@ -579,8 +638,10 @@ write.csv(stk31_positive_distribution, file.path(out_dir, "stk31_positive_cell_d
 
 summary_table <- data.frame(
   item = c(
-    "target_gene", "stk31_high_clusters", "stk31_high_cells", "nk_candidate_clusters",
-    "nk_candidate_cells", "other_cells", "detected_nk_markers"
+    "target_gene", "tumor_epithelial_celltype_label", "tumor_epithelial_stk31_high_cutoff",
+    "tumor_epithelial_cells", "stk31_high_tumor_epithelial_cells", "stk31_low_tumor_epithelial_cells",
+    "legacy_stk31_high_clusters_qc_only", "nk_candidate_clusters", "nk_candidate_cells", "other_cells",
+    "detected_nk_markers"
   ),
 
   value = c(
@@ -588,9 +649,12 @@ summary_table <- data.frame(
 # 关注基因和判定参数
 
     target_gene,
-
-    paste(stk31_high_clusters, collapse = ";"),
-    length(stk31_cells),
+    tumor_epithelial_celltype_label,
+    tumor_epithelial_assignment$cutoff,
+    tumor_epithelial_assignment$tumor_epithelial_cells,
+    length(tumor_epithelial_stk31_high_cells),
+    length(tumor_epithelial_stk31_low_cells),
+    paste(legacy_stk31_high_clusters_qc_only, collapse = ";"),
     paste(nk_clusters, collapse = ";"),
     length(nk_cells),
     length(other_cells),
@@ -617,6 +681,11 @@ write_plot(
     ggtitle("Manual annotation with NK marker score candidates")
 )
 write_plot(
+  file.path(out_dir, "umap_manual_celltype_with_stk31_tumor_epithelial_split.pdf"),
+  DimPlot(obj, reduction = "umap", group.by = "manual_celltype_stk31_tumor_epithelial_split", label = TRUE, repel = TRUE) +
+    ggtitle("Manual annotation with STK31 high/low tumor epithelial split")
+)
+write_plot(
   file.path(out_dir, "umap_cluster_celltype_labels.pdf"),
 
   DimPlot(obj, reduction = "umap", group.by = "cluster_celltype_label", label = TRUE, repel = TRUE) +
@@ -635,7 +704,7 @@ write_plot(
 
   DimPlot(obj, reduction = "umap", group.by = "relationship_group", label = FALSE) +
 
-    ggtitle("STK31 high clusters and NK candidate clusters")
+    ggtitle("STK31-high tumor epithelial cells and NK candidate cells")
 
 )
 write_plot(
@@ -665,7 +734,7 @@ write_plot(
 if (!"umap" %in% names(obj@reductions)) {
   stop("UMAP reduction not found. Please run RunUMAP first.")
 }
-# --- UMAP 中心距离：STK31-high vs NK_cell ---
+# --- UMAP centroid distance: STK31-high tumor epithelial vs NK_cell ---
 umap <- Embeddings(obj, "umap")
 
 centroids <- aggregate(
@@ -674,12 +743,12 @@ centroids <- aggregate(
   FUN = mean
 )
 write.csv(centroids, file.path(out_dir, "relationship_group_umap_centroids.csv"), row.names = FALSE)
-if (all(c("STK31_high_cluster", "NK_cell") %in% centroids$group)) {
+if (all(c("STK31_high_tumor_epithelial", "NK_cell") %in% centroids$group)) {
   umap_cols <- setdiff(colnames(centroids), "group")[1:2]
-  stk31_center <- as.numeric(centroids[centroids$group == "STK31_high_cluster", umap_cols])
+  stk31_center <- as.numeric(centroids[centroids$group == "STK31_high_tumor_epithelial", umap_cols])
   nk_center <- as.numeric(centroids[centroids$group == "NK_cell", umap_cols])
   distance_table <- data.frame(
-    comparison = "STK31_high_cluster_vs_NK_cell",
+    comparison = "STK31_high_tumor_epithelial_vs_NK_cell",
     umap_centroid_distance = sqrt(sum((stk31_center - nk_center)^2))
 
   )
@@ -690,30 +759,36 @@ if (all(c("STK31_high_cluster", "NK_cell") %in% centroids$group)) {
 
 message("Running differential expression tests")
 # ---------- 差异分析（Wilcoxon 秩和检验）----------
-stk31_vs_nk <- run_marker_test(
+tumor_epithelial_high_vs_low <- run_marker_test(
   obj,
-  cells.1 = stk31_cells,
-  cells.2 = nk_cells,
-  output_file = file.path(out_dir, "markers_stk31_high_vs_nk.csv")
+  cells.1 = tumor_epithelial_stk31_high_cells,
+  cells.2 = tumor_epithelial_stk31_low_cells,
+  output_file = file.path(out_dir, "markers_stk31_high_vs_low_tumor_epithelial.csv")
 )
-stk31_vs_other <- run_marker_test(
+tumor_epithelial_high_vs_nk <- run_marker_test(
+  obj,
+  cells.1 = tumor_epithelial_stk31_high_cells,
+  cells.2 = nk_cells,
+  output_file = file.path(out_dir, "markers_stk31_high_tumor_epithelial_vs_nk.csv")
+)
+tumor_epithelial_high_vs_other <- run_marker_test(
   obj,
 
-  cells.1 = stk31_cells,
-  cells.2 = c(nk_cells, other_cells),
-  output_file = file.path(out_dir, "markers_stk31_high_vs_all_other.csv")
+  cells.1 = tumor_epithelial_stk31_high_cells,
+  cells.2 = c(nk_cells, tumor_epithelial_stk31_low_cells, other_cells),
+  output_file = file.path(out_dir, "markers_stk31_high_tumor_epithelial_vs_all_other.csv")
 )
 nk_vs_other <- run_marker_test(
   obj,
   cells.1 = nk_cells,
-  cells.2 = c(stk31_cells, other_cells),
+  cells.2 = c(tumor_epithelial_stk31_high_cells, tumor_epithelial_stk31_low_cells, other_cells),
   output_file = file.path(out_dir, "markers_nk_vs_all_other.csv")
 )
 
 # ---------- 候选 ligand-receptor 互作 ----------
 
 message("Inferring candidate ligand-receptor pathways")
-lr_links <- infer_lr_links(obj, stk31_cells, nk_cells, lr_reference)
+lr_links <- infer_lr_links(obj, tumor_epithelial_stk31_high_cells, nk_cells, lr_reference)
 write.csv(lr_links, file.path(out_dir, "candidate_ligand_receptor_pathways.csv"), row.names = FALSE)
 
 pathway_summary <- aggregate(
@@ -729,9 +804,10 @@ write.csv(pathway_summary, file.path(out_dir, "candidate_pathway_summary.csv"), 
 
 message("Trying optional GO enrichment")
 # GO BP 富集（需 clusterProfiler，没装则跳过）
-run_go_if_available(stk31_vs_nk, file.path(out_dir, "stk31_high_vs_nk"))
+run_go_if_available(tumor_epithelial_high_vs_low, file.path(out_dir, "stk31_high_vs_low_tumor_epithelial"))
 # GO BP 富集（需 clusterProfiler，没装则跳过）
-run_go_if_available(stk31_vs_other, file.path(out_dir, "stk31_high_vs_all_other"))
+run_go_if_available(tumor_epithelial_high_vs_nk, file.path(out_dir, "stk31_high_tumor_epithelial_vs_nk"))
+run_go_if_available(tumor_epithelial_high_vs_other, file.path(out_dir, "stk31_high_tumor_epithelial_vs_all_other"))
 # GO BP 富集（需 clusterProfiler，没装则跳过）
 run_go_if_available(nk_vs_other, file.path(out_dir, "nk_vs_all_other"))
 
@@ -741,7 +817,7 @@ saveRDS(obj, file.path(out_dir, "tissue2_stk31_nk_annotated_seurat.rds"))
 
 # ============================================================
 
-# --- 每个 cluster 的 marker 基因（用于验证 STK31-high cluster 的身份）---
+# --- Cluster markers for identity QC only, not for STK31-high grouping ---
 message("Finding all cluster markers (this may take a while)")
 all_markers <- FindAllMarkers(
   obj,
@@ -759,7 +835,7 @@ message("Done. Key outputs:")
 message("- ", file.path(out_dir, "all_cluster_markers.csv"))
 message("- ", file.path(out_dir, "stk31_expression_by_cluster.csv"))
 message("- ", file.path(out_dir, "nk_marker_score_by_cluster.csv"))
-message("- ", file.path(out_dir, "markers_stk31_high_vs_nk.csv"))
+message("- ", file.path(out_dir, "markers_stk31_high_tumor_epithelial_vs_nk.csv"))
 message("- ", file.path(out_dir, "candidate_ligand_receptor_pathways.csv"))
 
 # 结果输出到主目录下的 validation/ 子目录
@@ -777,20 +853,34 @@ obj$validation_celltype <- as.character(obj$manual_celltype)
 obj$validation_celltype[is.na(obj$validation_celltype) | !nzchar(obj$validation_celltype)] <- "Unassigned"
 obj$validation_celltype[as.character(obj$seurat_clusters) %in% nk_clusters] <- "NK_cell"
 obj$validation_celltype <- factor(obj$validation_celltype)
+obj$validation_celltype_stk31_tumor_epithelial_split <- as.character(obj$validation_celltype)
+obj$validation_celltype_stk31_tumor_epithelial_split[
+  obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"
+] <- "STK31_high_tumor_epithelial"
+obj$validation_celltype_stk31_tumor_epithelial_split[
+  obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"
+] <- "STK31_low_tumor_epithelial"
+obj$validation_celltype_stk31_tumor_epithelial_split <- factor(obj$validation_celltype_stk31_tumor_epithelial_split)
 
 obj$validation_group <- ifelse(
-# --- 定义分析用分组（STK31-high / NK_cell / Other）---
-  obj$stk31_group == "STK31_high_cluster", "STK31_high_cluster",
-  ifelse(obj$nk_group == "NK_cell", "NK_cell", "Other")
+# --- Define validation groups: STK31-high/low tumor epithelial, NK_cell, Other ---
+  obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial", "STK31_high_tumor_epithelial",
+  ifelse(
+    obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial", "STK31_low_tumor_epithelial",
+    ifelse(obj$nk_group == "NK_cell", "NK_cell", "Other")
+  )
 )
-obj$validation_group <- factor(obj$validation_group, levels = c("STK31_high_cluster", "NK_cell", "Other"))
+obj$validation_group <- factor(
+  obj$validation_group,
+  levels = c("STK31_high_tumor_epithelial", "STK31_low_tumor_epithelial", "NK_cell", "Other")
+)
 
 # 输出 cluster 细胞注释表
 
 cluster_annotation <- unique(data.frame(
   cluster = as.character(obj$seurat_clusters),
   validation_celltype = as.character(obj$validation_celltype),
-  stk31_high_group = as.character(obj$stk31_group),
+  tumor_epithelial_stk31_group = as.character(obj$tumor_epithelial_stk31_group),
   nk_group = as.character(obj$nk_group),
   stringsAsFactors = FALSE
 ))
@@ -813,9 +903,14 @@ write_plot(
     ggtitle("Validation cell types")
 )
 write_plot(
+  file.path(validation_dir, "umap_validation_celltypes_with_stk31_tumor_epithelial_split.pdf"),
+  DimPlot(obj, reduction = "umap", group.by = "validation_celltype_stk31_tumor_epithelial_split", label = TRUE, repel = TRUE) +
+    ggtitle("Validation cell types with STK31 high/low tumor epithelial split")
+)
+write_plot(
   file.path(validation_dir, "umap_validation_groups.pdf"),
   DimPlot(obj, reduction = "umap", group.by = "validation_group", label = TRUE, repel = TRUE) +
-    ggtitle("STK31-high and NK_cell groups")
+    ggtitle("STK31-high tumor epithelial and NK_cell groups")
 )
 
 # --- 批量验证 FeaturePlot ---
@@ -937,15 +1032,19 @@ if (file.exists(lr_file)) {
 # --- 差异基因 top 40 + GO 富集 ---
 
 message("Exporting top DE genes and running optional GO enrichment")
-if (!is.null(stk31_vs_nk) && nrow(stk31_vs_nk) > 0) {
-  write.csv(top_de_genes(stk31_vs_nk, 40), file.path(validation_dir, "top_stk31_vs_nk_genes.csv"), row.names = FALSE)
+if (!is.null(tumor_epithelial_high_vs_low) && nrow(tumor_epithelial_high_vs_low) > 0) {
+  write.csv(top_de_genes(tumor_epithelial_high_vs_low, 40), file.path(validation_dir, "top_stk31_high_vs_low_tumor_epithelial_genes.csv"), row.names = FALSE)
 # GO 富集（可选，没装 clusterProfiler 则跳过）
-  run_optional_go(stk31_vs_nk, "stk31_high_vs_nk", validation_dir)
+  run_optional_go(tumor_epithelial_high_vs_low, "stk31_high_vs_low_tumor_epithelial", validation_dir)
 }
-if (!is.null(stk31_vs_other) && nrow(stk31_vs_other) > 0) {
-  write.csv(top_de_genes(stk31_vs_other, 40), file.path(validation_dir, "top_stk31_vs_all_genes.csv"), row.names = FALSE)
+if (!is.null(tumor_epithelial_high_vs_nk) && nrow(tumor_epithelial_high_vs_nk) > 0) {
+  write.csv(top_de_genes(tumor_epithelial_high_vs_nk, 40), file.path(validation_dir, "top_stk31_high_tumor_epithelial_vs_nk_genes.csv"), row.names = FALSE)
 # GO 富集（可选，没装 clusterProfiler 则跳过）
-  run_optional_go(stk31_vs_other, "stk31_high_vs_all_other", validation_dir)
+  run_optional_go(tumor_epithelial_high_vs_nk, "stk31_high_tumor_epithelial_vs_nk", validation_dir)
+}
+if (!is.null(tumor_epithelial_high_vs_other) && nrow(tumor_epithelial_high_vs_other) > 0) {
+  write.csv(top_de_genes(tumor_epithelial_high_vs_other, 40), file.path(validation_dir, "top_stk31_high_tumor_epithelial_vs_all_genes.csv"), row.names = FALSE)
+  run_optional_go(tumor_epithelial_high_vs_other, "stk31_high_tumor_epithelial_vs_all_other", validation_dir)
 }
 if (!is.null(nk_vs_other) && nrow(nk_vs_other) > 0) {
   write.csv(top_de_genes(nk_vs_other, 40), file.path(validation_dir, "top_nk_vs_all_genes.csv"), row.names = FALSE)
@@ -956,14 +1055,19 @@ if (!is.null(nk_vs_other) && nrow(nk_vs_other) > 0) {
 # --- 验证分析总览 ---
 
 val_summary <- data.frame(
-  item = c("target_gene", "stk31_high_clusters", "stk31_high_cells",
-           "nk_candidate_clusters", "nk_candidate_cells",
+  item = c("target_gene", "tumor_epithelial_celltype_label", "tumor_epithelial_stk31_high_cutoff",
+           "tumor_epithelial_cells", "stk31_high_tumor_epithelial_cells", "stk31_low_tumor_epithelial_cells",
+           "legacy_stk31_high_clusters_qc_only", "nk_candidate_clusters", "nk_candidate_cells",
            "validation_groups", "validation_celltypes"),
   value = c(
 # 关注基因和判定参数
     target_gene,
-    paste(stk31_high_clusters, collapse = ";"),
-    sum(obj$stk31_group == "STK31_high_cluster"),
+    tumor_epithelial_celltype_label,
+    tumor_epithelial_assignment$cutoff,
+    tumor_epithelial_assignment$tumor_epithelial_cells,
+    sum(obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"),
+    sum(obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"),
+    paste(legacy_stk31_high_clusters_qc_only, collapse = ";"),
     paste(nk_clusters, collapse = ";"),
     sum(obj$nk_group == "NK_cell"),
     paste(levels(obj$validation_group), collapse = ";"),

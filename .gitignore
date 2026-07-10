@@ -16,6 +16,7 @@ results/**/*.html
 
 # Logs and temporary files
 logs/
+tmp/
 *.log
 *.tmp
 .DS_Store
