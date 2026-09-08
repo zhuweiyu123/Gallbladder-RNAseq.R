@@ -1,23 +1,26 @@
-# R session and editor artifacts
-.Rhistory
-.RData
-.Rproj.user/
-*.Rproj
-
-# Local raw single-cell data and large generated outputs
-胆囊癌/
-gallbladder_cancer/
-results/**/*.rds
-results/**/*.h5ad
-results/**/*.h5seurat
-results/**/*.pdf
-results/**/*.png
-results/**/*.html
-
-# Logs and temporary files
-logs/
-tmp/
-*.log
-*.tmp
-.DS_Store
-Thumbs.db
+# Allow only project scripts and documentation.
+/*
+!/.gitignore
+!/.gitattributes
+!/*.md
+!/*.txt
+!/scripts/
+/scripts/**
+!/scripts/**/
+!/scripts/**/*.R
+!/scripts/**/*.r
+!/scripts/**/*.py
+!/scripts/**/*.sh
+!/scripts/**/*.ps1
+!/scripts/**/*.md
+!/scripts/**/*.txt
+!/scripts/**/*.Rmd
+!/scripts/**/*.qmd
+# Temporary/editor files, including inside scripts.
+**/__pycache__/
+**/.ipynb_checkpoints/
+**/.Rproj.user/
+**/*~
+**/*.tmp
+**/*.log
+**/.DS_Store
