@@ -39,15 +39,15 @@ The scripts assume raw 10x data is available on the analysis server under:
    - Runs the basic Seurat workflow for tissue2.
    - Performs QC, normalization, PCA, clustering, UMAP, and saves the tissue2 Seurat object.
 
-2. `scripts/02_merged_basic_analysis.R`
-   - Runs the merged workflow across tissue1, tissue2, tissue4, and tissue5.
-   - Includes the merged STK31/NK analysis, the former merged follow-up checks, CellChat/GO plotting, and focused STK31-high epithelial/NK CellChat figures.
-   - Writes the core merged outputs to `/home/zhuweiyu/codex-r/results/merged_basic_seurat` and STK31/NK outputs under `/home/zhuweiyu/codex-r/results/merged_stk31_nk_analysis`.
-
-3. `scripts/03_tissue2_stk31_nk_analysis.R`
-   - Runs the tissue2 STK31/NK analysis from the tissue2 basic Seurat object.
-   - Includes the former validation checks: cell identity markers, NK signatures, pathway panels, top DE exports, and optional GO analysis.
+2. `scripts/03_tissue2_stk31_nk_analysis.R`
+   - Runs the tissue2 STK31/NK analysis from the tissue2 basic Seurat object (depends on 01).
+   - Includes cell identity annotation, NK cluster scoring, differential expression, candidate ligand-receptor screening, GO enrichment, and validation checks.
    - Writes the main outputs to `/home/zhuweiyu/codex-r/results/tissue2_stk31_nk_analysis` and validation outputs under its `validation/` subdirectory.
+
+3. `scripts/02_merged_basic_analysis.R`
+   - Runs the merged workflow across tissue1, tissue2, tissue4, and tissue5 (independent of 01/03).
+   - Includes the merged STK31/NK analysis, follow-up checks, CellChat/GO plotting, and focused STK31-high epithelial/NK CellChat figures.
+   - Writes the core merged outputs to `/home/zhuweiyu/codex-r/results/merged_basic_seurat` and STK31/NK outputs under `/home/zhuweiyu/codex-r/results/merged_stk31_nk_analysis`.
 
 ## Expected Runtime
 
@@ -65,6 +65,8 @@ Example run pattern:
 ```bash
 cd /home/zhuweiyu/codex-r
 /usr/bin/Rscript scripts/01_tissue2_basic_seurat.R 2>&1 | tee logs/01_tissue2_basic_seurat.log
+/usr/bin/Rscript scripts/03_tissue2_stk31_nk_analysis.R 2>&1 | tee logs/03_tissue2_stk31_nk_analysis.log
+/usr/bin/Rscript scripts/02_merged_basic_analysis.R 2>&1 | tee logs/02_merged_basic_analysis.log
 ```
 
 ## Notes
