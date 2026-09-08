@@ -1,13 +1,26 @@
+# ========================================================================
+# 【中文阅读指南】从旧版分析结果拼装导师汇报 PPT
+# 输入：ROOT 下已有 CellChat/STK31 图和 CSV；通过本地 pdftoppm 把 PDF 转为 PNG。
+# 流程：检查目录 → 转换/复用图片 → 读取摘要 → 创建宽屏幻灯片 → 加入文字、图片、表格 → 保存。
+# 输出：results/STK31_NK_mentor_ppt 中的 PPTX 与 png 图片缓存。
+# 依赖 python-pptx 和 Poppler；ROOT、PDFTOPPM 是本机绝对路径，换电脑时需要核对。
+# 幻灯片说明有固定撰写的文字；再次运行不会自动根据新数据重写生物学结论。
+# Python 入门：def 定义函数；缩进表示代码归属；字典保存键值对；Path 管理文件路径。
+# 先读顶部输入路径与函数说明，再看文件末尾入口；不要把图中文字当作自动生成的统计结论。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 from pathlib import Path
 import csv
 import subprocess
 
+# 【PPT 工具包】python-pptx 用于创建演示文稿；Inches/Pt 在调用处将常用单位转换为内部长度。
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 
 
+# 【项目根目录】后面的输入输出路径以此为起点；相对脚本定位与写死本机路径的可移植性不同。
 ROOT = Path(r"E:\ZHUWEIYU\Documents\R")
 OUT_DIR = ROOT / "results" / "STK31_NK_mentor_ppt"
 PNG_DIR = OUT_DIR / "png"
@@ -19,6 +32,7 @@ FOCUSED = ROOT / "results" / "merged_cellchat_focused_stk31_nk"
 CELLCHAT = ROOT / "results" / "merged_cellchat_go_plots"
 MERGED = ROOT / "results" / "merged_stk31_nk_analysis"
 
+# 【素材清单】字典的键是图片简称、值是 PDF 路径；后面的循环用它定位要插入的图。
 FIGURES = {
     "umap_celltype": MERGED / "umap_manual_celltype_annotation.pdf",
     "umap_stk31": MERGED / "umap_stk31_expression.pdf",
@@ -30,11 +44,14 @@ FIGURES = {
 }
 
 
+# 【函数：ensure_dirs】建立输出与 PNG 缓存目录；parents=True 自动建父目录，exist_ok=True 允许目录已存在。
 def ensure_dirs():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     PNG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# 【函数：pdf_to_png】调用外部 pdftoppm 将 PDF 转为可插入 PPT 的 PNG，并用修改时间判断是否复用缓存。
+# 返回图片路径；缺失输入如何处理取决于当前旧版/refined 版的分支。
 def pdf_to_png(name: str, pdf_path: Path) -> Path:
     if not pdf_path.exists():
         raise FileNotFoundError(f"Missing figure: {pdf_path}")
@@ -54,11 +71,14 @@ def pdf_to_png(name: str, pdf_path: Path) -> Path:
     return png_path
 
 
+# 【函数：load_csv】把 CSV 的每一行读成字典，列名是键，返回字典列表。
+# utf-8-sig 可兼容带 BOM 的 CSV；字段值通常仍是字符串，计算前要转换。
 def load_csv(path: Path):
     with path.open("r", encoding="utf-8-sig", newline="") as f:
         return list(csv.DictReader(f))
 
 
+# 【函数：load_summary】一次读取机制轴、细胞对与相互作用三个层级的摘要，供 PPT 页面引用。
 def load_summary():
     axis_rows = load_csv(FOCUSED / "stk31_high_tumor_epithelial_nk_mechanism_axis_summary.csv")
     pair_rows = load_csv(FOCUSED / "stk31_high_tumor_epithelial_nk_pair_level_cellchat_summary.csv")
@@ -66,6 +86,8 @@ def load_summary():
     return axis_rows, pair_rows, mech_rows
 
 
+# 【函数：add_textbox】在幻灯片上指定位置建立文本框，设置文字、字号、颜色等。
+# left/top 是位置，width/height 是尺寸；调用处用 Inches，字号用 Pt。
 def add_textbox(slide, text, left, top, width, height, font_size=18, bold=False, color=(30, 30, 30), align=None):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
@@ -84,12 +106,14 @@ def add_textbox(slide, text, left, top, width, height, font_size=18, bold=False,
     return box
 
 
+# 【函数：add_title】统一创建页面标题及可选副标题，使整套 PPT 的标题布局一致。
 def add_title(slide, title, subtitle=None):
     add_textbox(slide, title, Inches(0.45), Inches(0.25), Inches(12.45), Inches(0.5), 24, True, (18, 64, 98))
     if subtitle:
         add_textbox(slide, subtitle, Inches(0.48), Inches(0.78), Inches(12.1), Inches(0.35), 11, False, (90, 90, 90))
 
 
+# 【函数：add_bullets】将 bullets 列表逐项写入文本框的段落，并设置字号和段落布局。
 def add_bullets(slide, bullets, left, top, width, height, font_size=15):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
@@ -106,10 +130,14 @@ def add_bullets(slide, bullets, left, top, width, height, font_size=15):
     return box
 
 
+# 【函数：add_note】在页面上添加简短说明文字；本函数实现以实际文本框位置为准。
+# 这是页面上的注解，不应自动理解为 PowerPoint 的演讲者备注区。
 def add_note(slide, text):
     add_textbox(slide, text, Inches(0.55), Inches(6.72), Inches(12.15), Inches(0.33), 10, False, (110, 110, 110))
 
 
+# 【函数：add_image_fit】在给定矩形区域内按图片宽高比放置图片，避免拉伸失真。
+# 图片路径和目标区域由调用处传入。
 def add_image_fit(slide, image_path, left, top, width, height):
     pic = slide.shapes.add_picture(str(image_path), left, top)
     scale = min(width / pic.width, height / pic.height)
@@ -120,6 +148,8 @@ def add_image_fit(slide, image_path, left, top, width, height):
     return pic
 
 
+# 【函数：add_table】按 rows/headers 建立 PPT 表格，填入单元格并统一格式。
+# 用于展示摘要数值，表格不会自动执行统计分析。
 def add_table(slide, rows, headers, left, top, width, height, font_size=11):
     table = slide.shapes.add_table(len(rows) + 1, len(headers), left, top, width, height).table
     for j, header in enumerate(headers):
@@ -143,21 +173,26 @@ def add_table(slide, rows, headers, left, top, width, height, font_size=11):
     return table
 
 
+# 【函数：fmt_float】将数值格式化到指定位数，便于表格展示；格式化不改变原始数据文件。
 def fmt_float(value, digits=4):
     return f"{float(value):.{digits}f}"
 
 
+# 【函数：build_ppt】主流程：准备素材，创建宽屏演示文稿，按顺序加页面并保存 PPTX。
+# 函数内的页面标题、说明和部分数字是固定文本；换分析结果后应一起核对。
 def build_ppt():
     ensure_dirs()
     pngs = {name: pdf_to_png(name, path) for name, path in FIGURES.items()}
     axis_rows, pair_rows, mech_rows = load_summary()
 
+    # 【创建幻灯片文件】新建空白演示文稿；下面设置页面宽高，再使用空白版式逐页排版。
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
 
     # 1. Title
+    # 【添加一页】每次调用新建一张幻灯片；后面的 add_title/add_image_fit 等都写到这一页。
     slide = prs.slides.add_slide(blank)
     add_textbox(slide, "STK31高表达肿瘤上皮细胞与NK细胞互作证据", Inches(0.8), Inches(1.1), Inches(11.8), Inches(0.7), 31, True, (18, 64, 98), PP_ALIGN.CENTER)
     add_textbox(slide, "给导师汇报用：为什么选这几张图，以及每张图说明什么", Inches(1.15), Inches(2.0), Inches(11.0), Inches(0.55), 18, False, (80, 80, 80), PP_ALIGN.CENTER)
@@ -279,9 +314,11 @@ def build_ppt():
     ], Inches(0.95), Inches(1.2), Inches(11.6), Inches(4.9), 18)
     add_note(slide, "这页用于结尾：目前是机制线索，下一步实验验证可以把故事补成因果链。")
 
+    # 【保存 PPTX】把内存中的演示文稿写入目标文件；同名文件会被本次内容更新。
     prs.save(PPTX_PATH)
     return PPTX_PATH
 
 
+# 【脚本入口】直接运行本文件时执行下面的主函数；作为模块导入时不自动执行这段入口。
 if __name__ == "__main__":
     print(build_ppt())

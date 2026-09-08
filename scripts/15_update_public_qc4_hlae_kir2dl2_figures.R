@@ -1,5 +1,19 @@
 #!/usr/bin/env Rscript
+# ========================================================================
+# 【中文阅读指南】为公共 QC4 图补充 HLA-E 与 KIR2DL2
+# 输入：GBC_STK31_public_scRNA 中的目标计数、细胞/样本信息以及 NK.RDS。
+# 流程：按 QC4 样本选择细胞 → 计算恶性上皮 HLA 指标 → 计算 NK/NKT 亚型受体指标 → 更新图表。
+# 输出：11_figures/current_paper_minimal/paired_QC4 与对应 12_tables 目录。
+# HLA-E 作为额外目标基因，KIR2DL2 作为额外 NK 受体；可用基因集合先与实际矩阵取交集。
+# 基因缺失与基因存在但计数为零需分开理解；图只描述所选样本与亚型的表达。
+# 阅读顺序：文件开头的路径/参数 → 工具函数 → 主流程；函数定义本身不会执行分析。
+# R 入门：<- 是赋值；$ 取一列/一个成员；[行,列] 取子集；c() 建向量；list() 装不同类型对象。
+# NA 表示缺失，不等于 0；counts 是原始计数，data 通常是 log 标准化表达。
+# 运行环境：本项目默认在 Linux 服务器 /home/zhuweiyu/codex-r 下用 Rscript 运行。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 
+# 【加载依赖】library 加载本脚本用到的包；外层只隐藏启动提示，不会安装缺失的包。
 suppressPackageStartupMessages({
   library(data.table)
   library(Matrix)
@@ -10,8 +24,12 @@ suppressPackageStartupMessages({
 project <- "/home/zhuweiyu/codex-r/GBC_STK31_public_scRNA"
 figure_dir <- file.path(project, "11_figures", "current_paper_minimal", "paired_QC4")
 table_dir <- file.path(project, "12_tables", "current_paper_minimal", "paired_QC4")
+# 【函数：stop_if_not】把关键数据约束写成检查：只有 ok 明确为 TRUE 才继续，否则报告 message 并停止。
 stop_if_not <- function(ok, message) if (!isTRUE(ok)) stop(message, call. = FALSE)
+# 【函数：save_figure】将图写入相应结果目录，通常同时生成 PNG 和 PDF。
+# stem 是不含扩展名的文件名；绘图数据在主流程中另外导出。
 save_figure <- function(plot, stem, width, height) {
+  # 【保存图形】输出格式由扩展名决定；width/height 默认按英寸，dpi 主要影响位图清晰度。
   ggsave(file.path(figure_dir, paste0(stem, ".png")), plot,
          width = width, height = height, dpi = 320, bg = "white")
   ggsave(file.path(figure_dir, paste0(stem, ".pdf")), plot,
@@ -20,12 +38,15 @@ save_figure <- function(plot, stem, width, height) {
 
 qc4 <- c("GBC_033_P", "GBC_047_P", "GBC_056_P", "GBC_073_P")
 
+# 【上皮面板】在选定 QC4 样本的恶性上皮中，统计 HLA-I 相关基因并补充 HLA-E。
 # QC4 malignant epithelial HLA-I figure with HLA-E.
 hla_genes <- c("HLA-A", "HLA-B", "HLA-C", "HLA-E", "B2M")
+# 【读取中间对象】readRDS 恢复之前保存的 R 对象；检查文件路径和对象来自哪一版注释。
 target_counts <- readRDS(file.path(
   project, "02_processed_data", "malignant_epithelial", "target_counts",
   "malignant_target_raw_counts.rds"
 ))
+# 【读入表格】把已有 CSV/TSV 读入内存；后续列名检查用于确认文件格式符合预期。
 mal_meta <- fread(file.path(
   project, "02_processed_data", "malignant_epithelial",
   "malignant_cell_metadata.csv.gz"
@@ -47,8 +68,11 @@ stop_if_not(length(mal_idx) == 13368L,
             "QC4 malignant epithelial cell total must be 13,368")
 qc_target <- target_counts[, mal_idx, drop = FALSE]
 qc_library <- mal_library$all_gene_raw_umi[mal_idx]
+# 【批量处理】lapply 对向量/列表的每个元素执行一次函数，返回列表；rbind/do.call 可再把结果按行拼表。
 hla_stats <- rbindlist(lapply(hla_genes, function(gene) {
   values <- as.numeric(qc_target[gene, ])
+  # 【快速表格】data.table 是高效表格结构；DT[条件,计算,by=分组] 表示先筛行，再按组汇总。
+  # := 在表内更新列，.N 是当前组的行数；对逐细胞表而言通常就是细胞数。
   data.table(
     gene = gene,
     malignant_cell_n = length(values),
@@ -60,13 +84,16 @@ hla_stats <- rbindlist(lapply(hla_genes, function(gene) {
 }))
 hla_stats[, `:=`(
   log1p_pseudobulk_CPM = log1p(pseudobulk_CPM),
+  # 【类别顺序】factor 把文本变成类别；levels 控制图表顺序，也可能影响模型参考组。
   gene = factor(gene, levels = rev(hla_genes))
 )]
+# 【导出表格】将当前统计或注释写入文件，方便用 Excel 查看；文件名与目录见本次调用。
 fwrite(
   hla_stats,
   file.path(table_dir, "QC4_Figure2_malignant_HLAI_stats_plus_HLAE.csv")
 )
 
+# 【ggplot 图层】aes 把表格列映射到坐标/颜色/大小，后面的 + 逐层加入点、线、主题和标签。
 p_hla <- ggplot(hla_stats, aes("Malignant epithelial cells", gene)) +
   geom_point(aes(size = RNA_detected_fraction, color = log1p_pseudobulk_CPM)) +
   scale_size_continuous(
@@ -86,6 +113,7 @@ save_figure(
 rm(target_counts, qc_target)
 gc()
 
+# 【NK/NKT 面板】改用 NK 对象及其亚型，补充 KIR2DL2；这一面板的细胞分母与上皮面板不同。
 # QC4 public NK/NKT subtype figure with KIR2DL2.
 nk_receptors <- c("KLRC1", "KIR3DL1", "KIR2DL1", "KIR2DL2", "KIR2DL3", "KLRD1")
 nk <- readRDS(file.path(project, "01_raw_data", "NK.RDS"))
@@ -103,6 +131,7 @@ nk_meta[, `:=`(
   nk_subtype = as.character(celltype),
   all_gene_raw_umi = as.numeric(Matrix::colSums(nk_counts))
 )]
+# 【集合差集】setdiff(a,b) 返回 a 中不属于 b 的元素，用于找缺失基因或定义比较的另一组。
 missing_nk_receptors <- setdiff(nk_receptors, rownames(nk_counts))
 stop_if_not(identical(missing_nk_receptors, "KIR2DL2"),
             paste("Unexpected missing QC4 NK receptors:",

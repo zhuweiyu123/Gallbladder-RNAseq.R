@@ -1,3 +1,13 @@
+# ========================================================================
+# 【中文阅读指南】通过 HTTP 接口生成并下载图片的辅助脚本
+# 输入：Prompt 或位置参数中的图片描述；ApiKey 参数或环境变量提供认证信息。
+# 流程：整理参数 → 构造 JSON → curl.exe 发送请求 → 解析返回文字中的图片 URL → 下载到 OutFile。
+# 输出：默认当前目录 images 下的时间戳 JPG 文件；-NoDownload 只输出链接。
+# 这是仓库中的独立图片辅助工具，不参与单细胞分析。BaseUrl 和 Model 控制请求目标。
+# 本文件注释解释现有实现；实际接口是否仍支持该模型应在需要调用时另行确认。
+# PowerShell 入门：$ 开头是变量；@{} 是键值表；| 把结果传给下一条命令；# 后为注释。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 <#
 .SYNOPSIS
   Generate an image via APINebula (or compatible) using grok-imagine-image.
@@ -30,6 +40,7 @@
 .EXAMPLE
   .\scripts\imagine.ps1 -Prompt "sunset over ocean" -OutFile .\sunset.jpg
 #>
+# 【参数入口】运行时可传 -Prompt、-OutFile 等；[switch] 表示只需写开关名，不必再跟 True。
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
@@ -50,6 +61,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# 【函数：Get-ApiKey】按优先级取认证信息：显式 ApiKey → APINEBULA_API_KEY → XAI_API_KEY。
+# 都没有时停止；不在脚本中写入实际密钥。
 function Get-ApiKey {
     param([string]$Explicit)
     if ($Explicit) { return $Explicit }
@@ -58,6 +71,8 @@ function Get-ApiKey {
     throw "No API key. Set APINEBULA_API_KEY (or pass -ApiKey)."
 }
 
+# 【函数：Get-PromptText】优先使用命名参数 Prompt，否则把位置参数 PromptParts 用空格拼起来。
+# 去掉首尾空白；没有有效描述时抛出错误。
 function Get-PromptText {
     param([string]$Prompt, [string[]]$PromptParts)
     if ($Prompt -and $Prompt.Trim()) { return $Prompt.Trim() }
@@ -67,6 +82,7 @@ function Get-PromptText {
     throw "Missing prompt. Example: .\scripts\imagine.ps1 `"a red apple on a table`""
 }
 
+# 【函数：ConvertFrom-JsonSafe】把接口返回的 JSON 字符串转为 PowerShell 对象，解析失败时提供错误上下文。
 function ConvertFrom-JsonSafe {
     param([string]$Text)
     try {
@@ -76,6 +92,8 @@ function ConvertFrom-JsonSafe {
     }
 }
 
+# 【函数：Find-ImageUrl】依次尝试 Markdown 图片、常见图片扩展名 URL、指定图片主机形式。
+# 返回第一个匹配链接；都没有时返回 null，由主流程判断为失败。
 function Find-ImageUrl {
     param([string]$Text)
     if (-not $Text) { return $null }
@@ -109,6 +127,7 @@ if (-not $OutFile) {
     $OutFile = Join-Path $dir "imagine-$stamp.jpg"
 }
 
+# 【请求体】哈希表描述模型和用户消息；下一步转换成接口可接收的 JSON 文本。
 $bodyObj = @{
     model = $Model
     messages = @(
@@ -119,6 +138,7 @@ $bodyObj = @{
     )
 }
 $bodyJson = $bodyObj | ConvertTo-Json -Depth 6 -Compress
+# 【临时文件】将 JSON 写入临时文件，通过 --data-binary 发送，减少命令行引号和中文编码干扰。
 $tmpBody = Join-Path $env:TEMP ("grok-imagine-" + [guid]::NewGuid().ToString("N") + ".json")
 [System.IO.File]::WriteAllText($tmpBody, $bodyJson)
 
@@ -127,6 +147,7 @@ Write-Host "model: $Model"
 Write-Host "prompt: $promptText"
 
 try {
+    # 【发送请求】& 调用外部程序，反引号续行；Authorization 携带令牌，返回文本存入 raw。
     $raw = & curl.exe -sS --fail-with-body `
         -X POST $endpoint `
         -H "Authorization: Bearer $key" `
@@ -135,10 +156,12 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "HTTP request failed (exit $LASTEXITCODE): $raw"
     }
+# 【清理】请求成功或失败都会进入 finally，删除本次创建的请求体临时文件。
 } finally {
     Remove-Item -LiteralPath $tmpBody -ErrorAction SilentlyContinue
 }
 
+# 【响应解析】优先读 choices[0].message.content，再尝试 output_text；最后保留原始响应用于排查。
 $resp = ConvertFrom-JsonSafe -Text $raw
 $content = $null
 if ($resp.choices -and $resp.choices[0].message.content) {
@@ -161,6 +184,7 @@ if (-not $url) {
 Write-Host ""
 Write-Host "image url: $url"
 
+# 【仅返回链接】启用 -NoDownload 时此处正常退出，后续下载代码不再执行。
 if ($NoDownload) {
     Write-Output $url
     exit 0
@@ -171,6 +195,7 @@ if ($outDir -and -not (Test-Path $outDir)) {
     New-Item -ItemType Directory -Path $outDir | Out-Null
 }
 
+# 【下载图片】-L 跟随重定向，-o 写入 OutFile；退出码非零时报告下载失败。
 & curl.exe -sS -L --fail -o $OutFile $url
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to download image from $url"

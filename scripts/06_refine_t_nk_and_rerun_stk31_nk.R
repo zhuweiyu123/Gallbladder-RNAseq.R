@@ -1,3 +1,18 @@
+# ========================================================================
+# 【中文阅读指南】细化 T/NK 注释，再重跑 STK31 与通讯分析
+# 输入：合并基础对象、旧细胞类型注释表和旧分析汇总表。
+# 阶段 1：提取 T/NK 候选、重新聚类，以 T、NK、排除标志基因细化注释并质控。
+# 阶段 2：冻结新标签，重建 STK31 分组，计算差异基因、候选配体受体和 NK 功能分数。
+# 阶段 3：CellChat 比较 STK31-high/low 上皮与高置信 NK 之间的双向通讯。
+# 输出分别在 merged_tnk_refined_annotation、merged_stk31_nk_refined_analysis、merged_cellchat_refined_high_low_nk。
+# STK31_STAGE_START 默认为 1；选择 2 或 3 需要前面阶段的对象和检查结果已存在。
+# NK_cell 是最终高置信分组；T_NK_ambiguous 保留身份不确定的细胞，不能直接并入 NK。
+# 阅读顺序：文件开头的路径/参数 → 工具函数 → 主流程；函数定义本身不会执行分析。
+# R 入门：<- 是赋值；$ 取一列/一个成员；[行,列] 取子集；c() 建向量；list() 装不同类型对象。
+# NA 表示缺失，不等于 0；counts 是原始计数，data 通常是 log 标准化表达。
+# 运行环境：本项目默认在 Linux 服务器 /home/zhuweiyu/codex-r 下用 Rscript 运行。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 # ============================================================
 # 06_refine_t_nk_and_rerun_stk31_nk.R
 # ============================================================
@@ -11,12 +26,14 @@
 # Stage gate: Stage 2/3 run only if Stage 1 QC passes.
 # ============================================================
 
+# 【加载依赖】library 加载本脚本用到的包；外层只隐藏启动提示，不会安装缺失的包。
 suppressPackageStartupMessages({
   library(Seurat)
   library(Matrix)
   library(ggplot2)
 })
 
+# 【可重复性】固定随机数起点，使同一环境下的抽样/随机算法更易复现；不同包版本仍可能产生差异。
 set.seed(20260717)
 
 # -------------------- paths / params --------------------
@@ -34,28 +51,42 @@ old_summary_file <- file.path(
 stage1_dir <- file.path(project_dir, "results/merged_tnk_refined_annotation")
 stage2_dir <- file.path(project_dir, "results/merged_stk31_nk_refined_analysis")
 stage3_dir <- file.path(project_dir, "results/merged_cellchat_refined_high_low_nk")
+# 【输出目录】recursive=TRUE 可连同父目录一起建立；路径变量决定结果实际写到哪里。
 dir.create(stage1_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(stage2_dir, showWarnings = FALSE, recursive = TRUE)
 dir.create(stage3_dir, showWarnings = FALSE, recursive = TRUE)
 
 target_gene <- "STK31"
 tumor_epithelial_celltype_label <- "Epithelial"
+# 【参数 tumor_epithelial_stk31_high_quantile】上皮内 high 的分位数设定，0.75 表示第 75 百分位；实际阈值和并列值会影响 high 数量。
 tumor_epithelial_stk31_high_quantile <- 0.75
+# 【参数 min_cells_for_de】差异分析两组需达到的最低细胞数；过小的群会停止或跳过检验。
 min_cells_for_de <- 10
+# 【参数 min_cells_per_cellchat_group】每个通讯群需达到的最低细胞数；不是患者样本量。
 min_cells_per_cellchat_group <- 10
+# 【参数 max_cells_per_cellchat_group】通讯分析每群的抽样上限，用于控制内存与耗时；实际群大小另有导出表。
 max_cells_per_cellchat_group <- 1500
 run_exact_wilcox <- TRUE
 # Speed control for large DE (without presto). Descriptive only.
+# 【参数 max_cells_per_ident_de】每组用于差异检验的最大细胞数；抽样会影响精确数值，需保留随机种子。
+# 【可调参数】Sys.getenv 先读环境变量，未设置时使用代码中的默认值；as.integer/as.numeric 把文本转为数值。
 max_cells_per_ident_de <- as.integer(Sys.getenv("STK31_MAX_CELLS_DE", "500"))
 # Resume control: "1" full run; "2" skip stage1 if QC passed; "3" stage3 only
+# 【断点续跑】1 从注释开始，2/3 从后续阶段开始；后续阶段仍需要前面保存的对象和质控依据。
 stage_start <- as.integer(Sys.getenv("STK31_STAGE_START", "1"))
 
 # Subclustering
+# 【参数 tnk_resolution】T/NK 子集图聚类分辨率，越大通常得到更多子群。
 tnk_resolution <- 0.4
+# 【参数 tnk_n_variable】T/NK 子集选择的高变基因数，用于后续降维。
 tnk_n_variable <- 2000
+# 【参数 tnk_n_pcs】在 T/NK 子集中计算的 PCA 主成分数量。
 tnk_n_pcs <- 30
+# 【参数 tnk_use_dims】从已计算的 PCA 中实际用于邻居图/UMAP 的维度范围。
 tnk_use_dims <- 1:20
+# 【参数 nk_score_cluster_quantile】按群 NK 分数分位数扩充候选的阈值；值越大筛选通常越严格。
 nk_score_cluster_quantile <- 0.85
+# 【参数 score_delta】T/NK 分数差达到这一量级才认为有明确偏好；这是注释规则参数。
 score_delta <- 0.05
 
 t_markers <- c("CD3D", "CD3E", "CD3G", "TRAC", "TRBC1", "TRBC2", "CD2", "CD247")
@@ -114,12 +145,18 @@ mechanism_axes <- list(
 mhc_i_genes <- c("HLA-A", "HLA-B", "HLA-C", "HLA-E", "HLA-F", "B2M")
 
 # -------------------- helpers (from 02 patterns) --------------------
+# 【函数：stop_if_missing】先检查输入文件是否存在；缺失时立刻 stop，避免下游产生误导性结果。
 stop_if_missing <- function(path) {
   if (!file.exists(path)) stop("Missing file: ", path)
 }
 
+# 【函数：available_genes】把想看的基因与对象实际行名取交集，避免访问不存在的基因。
+# 返回基因名向量；返回长度为零表示这些基因不在当前矩阵内。
+# 【集合交集】intersect 只保留两份名单共有的元素，常用于筛选当前数据真正有的基因/细胞。
 available_genes <- function(object, genes) intersect(genes, rownames(object))
 
+# 【函数：fetch_gene_matrix】从 Seurat 对象提取指定基因的表达矩阵，并兼容不同版本的 layer/slot 接口。
+# 返回矩阵通常是基因×细胞；data 是标准化层，counts 是原始计数层。
 fetch_gene_matrix <- function(object, genes, slot = "data") {
   genes <- available_genes(object, genes)
   if (length(genes) == 0) return(NULL)
@@ -130,24 +167,33 @@ fetch_gene_matrix <- function(object, genes, slot = "data") {
   }
 }
 
+# 【函数：write_plot】把传入的绘图对象写到指定文件；width、height 控制版面大小。
+# 将画图与保存封装起来，可以让同一套输出保持一致尺寸。
 write_plot <- function(path, plot, width = 8, height = 6) {
   pdf(path, width = width, height = height)
   print(plot)
   dev.off()
 }
 
+# 【函数：write_base_pdf】打开 PDF 绘图设备，执行 expr 中的绘图表达式，再关闭设备。
+# 基础 R 图与 ggplot 的保存方式不同；关闭设备后文件才完整写出。
 write_base_pdf <- function(path, expr, width = 8, height = 6) {
   pdf(path, width = width, height = height)
   force(expr)
   dev.off()
 }
 
+# 【函数：module_score】对可用基因的标准化表达逐细胞取平均，得到基因集合的简易表达分数。
+# 本函数没有 AddModuleScore 的匹配背景扣除；分数不能直接视为功能活性的实测值。
 module_score <- function(object, genes) {
   genes <- available_genes(object, genes)
   if (length(genes) == 0) return(rep(NA_real_, ncol(object)))
+  # 【按细胞求均值】在基因×细胞矩阵中，colMeans 对每列跨基因求平均，常用来构建逐细胞模块分数。
   as.numeric(Matrix::colMeans(fetch_gene_matrix(object, genes)))
 }
 
+# 【函数：gene_mean】对指定基因集合、指定细胞的表达取平均，得到一个汇总数值。
+# 没有可用基因或细胞时返回 NA，表示无法计算。
 gene_mean <- function(object, genes, cells = NULL) {
   genes <- available_genes(object, genes)
   if (length(genes) == 0) return(NA_real_)
@@ -157,8 +203,11 @@ gene_mean <- function(object, genes, cells = NULL) {
   mean(as.numeric(Matrix::colMeans(mat)))
 }
 
+# 【函数：read_summary_item】从 item/value 格式的旧汇总表读取指定项目，并把分号分隔的值拆开。
+# 文件、列或项目缺失时按函数分支返回 fallback。
 read_summary_item <- function(path, item_name, fallback = character(0)) {
   if (!file.exists(path)) return(fallback)
+  # 【读入表格】把已有 CSV/TSV 读入内存；后续列名检查用于确认文件格式符合预期。
   summary_df <- read.csv(path, stringsAsFactors = FALSE)
   if (!all(c("item", "value") %in% colnames(summary_df))) return(fallback)
   idx <- which(summary_df$item == item_name)
@@ -168,6 +217,9 @@ read_summary_item <- function(path, item_name, fallback = character(0)) {
   unlist(strsplit(as.character(value), ";", fixed = TRUE))
 }
 
+# 【函数：assign_tumor_epithelial_stk31_group】只在指定上皮细胞内计算 STK31 分位数阈值，随后生成 high/low 标签。
+# 阈值>0 时使用 >= 阈值；阈值为零时使用 >0；其余细胞保持 Other。
+# 返回 list，含每个细胞的标签、实际阈值与各组数量；先看这些数量再解读下游差异。
 assign_tumor_epithelial_stk31_group <- function(object, stk31_expr, celltype_col, celltype_label, high_quantile = 0.75) {
   tumor_epithelial_idx <- as.character(object[[celltype_col]][, 1]) == celltype_label
   if (sum(tumor_epithelial_idx) == 0) {
@@ -193,16 +245,21 @@ assign_tumor_epithelial_stk31_group <- function(object, stk31_expr, celltype_col
   )
 }
 
+# 【函数：run_marker_test】输入对象和两组细胞，调用差异表达检验并把基因表写入 output_file。
+# 重点看比较方向、avg_log2FC 和调整后 P 值；正 logFC 表示第一组相对第二组更高。
 run_marker_test <- function(object, cells.1, cells.2, output_file) {
   if (length(cells.1) < min_cells_for_de || length(cells.2) < min_cells_for_de) {
     warning("Too few cells for marker test: ", output_file)
     empty <- data.frame()
+    # 【导出表格】将当前统计或注释写入文件，方便用 Excel 查看；文件名与目录见本次调用。
     write.csv(empty, output_file, row.names = FALSE)
     return(empty)
   }
   object$.comparison_group <- "unused"
   object$.comparison_group[colnames(object) %in% cells.1] <- "group_1"
   object$.comparison_group[colnames(object) %in% cells.2] <- "group_2"
+  # 【差异表达】比较 ident.1 与 ident.2；avg_log2FC>0 表示第一组更高，p_val_adj 是多重检验调整后 P 值。
+  # min.pct/logfc.threshold 是进入检验的筛选条件；细胞级检验不自动控制患者内相关性。
   markers <- FindMarkers(
     object, ident.1 = "group_1", ident.2 = "group_2",
     group.by = ".comparison_group", logfc.threshold = 0.1, min.pct = 0.1,
@@ -215,6 +272,8 @@ run_marker_test <- function(object, cells.1, cells.2, output_file) {
   markers
 }
 
+# 【函数：average_expression_for_genes】对指定 cells 中每个目标基因计算表达摘要，供配体受体候选评分使用。
+# 返回按基因组织的结果；表达矩阵里缺失的基因应与真实零表达区分。
 average_expression_for_genes <- function(object, cells, genes) {
   genes <- available_genes(object, genes)
   if (length(genes) == 0 || length(cells) == 0) {
@@ -223,12 +282,15 @@ average_expression_for_genes <- function(object, cells, genes) {
   expr <- fetch_gene_matrix(object, genes)[genes, cells, drop = FALSE]
   data.frame(
     gene = genes,
+    # 【按基因求均值】在基因×细胞矩阵中，rowMeans 对每一行跨细胞求平均；若输入是 >0 的逻辑矩阵，得到检出比例。
     avg_expr = as.numeric(Matrix::rowMeans(expr)),
     pct_expr = as.numeric(Matrix::rowMeans(expr > 0)),
     stringsAsFactors = FALSE
   )
 }
 
+# 【函数：infer_lr_links】沿着候选表逐个读取配体与受体，结合发送细胞和接收细胞的表达摘要打分。
+# 这是人工候选配对的描述性筛选；不能把表达乘积当成已证实的分子结合或通讯概率。
 infer_lr_links <- function(object, high_cells, nk_cells, lr_table) {
   lr_genes <- unique(c(lr_table$ligand, lr_table$receptor))
   high_expr <- average_expression_for_genes(object, high_cells, lr_genes)
@@ -254,6 +316,8 @@ infer_lr_links <- function(object, high_cells, nk_cells, lr_table) {
   links[order(-links$interaction_score), ]
 }
 
+# 【函数：label_evidence】比较 high/low 两个通讯值，按最小强度和比值阈值标记更高、相近或未检出。
+# 默认比值阈值 1.25 是规则阈值，并不等于显著性检验。
 label_evidence <- function(prob_high, prob_low, similar_ratio = 1.25, min_prob = 1e-6) {
   if ((is.na(prob_high) || prob_high < min_prob) && (is.na(prob_low) || prob_low < min_prob)) {
     return("not_detected")
@@ -265,6 +329,7 @@ label_evidence <- function(prob_high, prob_low, similar_ratio = 1.25, min_prob =
   "similar"
 }
 
+# 【函数：write_session_info】保存 R/包版本及本次关键配置，方便追溯结果与重现运行环境。
 write_session_info <- function(path) {
   sink(path)
   cat("timestamp:", as.character(Sys.time()), "\n")
@@ -274,11 +339,14 @@ write_session_info <- function(path) {
   cat("tnk_resolution:", tnk_resolution, "\n")
   cat("score_delta:", score_delta, "\n")
   cat("tumor_epithelial_stk31_high_quantile:", tumor_epithelial_stk31_high_quantile, "\n")
+  # 【运行记录】记录 R 与已加载包的版本，帮助以后解释同一代码为何可能得到不同结果。
   print(sessionInfo())
   sink()
 }
 
+# 【函数：list_output_files】列出指定结果目录的文件，形成运行产物清单。
 list_output_files <- function(dirs) {
+  # 【批量处理】lapply 对向量/列表的每个元素执行一次函数，返回列表；rbind/do.call 可再把结果按行拼表。
   files <- unlist(lapply(dirs, function(d) {
     if (!dir.exists(d)) return(character(0))
     list.files(d, recursive = TRUE, full.names = TRUE)
@@ -306,6 +374,7 @@ if (stage_start >= 2) {
   stop_if_missing(resume_rds)
   stop_if_missing(qc_file)
   message("Resuming from Stage ", stage_start, " using ", resume_rds)
+  # 【读取中间对象】readRDS 恢复之前保存的 R 对象；检查文件路径和对象来自哪一版注释。
   obj <- readRDS(resume_rds)
   DefaultAssay(obj) <- "RNA"
   old_nk_cells <- colnames(obj)[as.character(obj$seurat_clusters) %in% old_nk_clusters]
@@ -322,6 +391,7 @@ obj <- readRDS(input_rds)
 DefaultAssay(obj) <- "RNA"
 if (utils::packageVersion("SeuratObject") >= "5.0.0") {
   if ("layers" %in% slotNames(obj[["RNA"]])) {
+    # 【Seurat v5 数据层】将拆分的数据层合并以供下游读取；这不是批次校正，也不是重新聚类。
     try(obj <- JoinLayers(obj, assay = "RNA"), silent = TRUE)
   }
 }
@@ -336,10 +406,12 @@ message("Legacy NK clusters: ", paste(old_nk_clusters, collapse = ","),
         " n=", length(old_nk_cells))
 
 # ============================================================
+# 【阶段 1】在 T/NK 候选子集中重新做表达处理和聚类，先把细胞身份分清，再进入下游比较。
 # STAGE 1: strict T/NK re-annotation
 # ============================================================
 message("=== STAGE 1: T/NK refinement ===")
 
+# 【扩充候选】检查所有原聚类的 NK 标志分数，避免仅局限于原先手工选的 0/1/5 群。
 # Score NK-ness on all clusters to expand candidates beyond 0/1/5
 obj$global_nk_score <- module_score(obj, nk_markers)
 obj$global_t_score <- module_score(obj, t_markers)
@@ -370,15 +442,24 @@ message("Candidate T/NK clusters: ", paste(candidate_clusters, collapse = ","))
 candidate_cells <- colnames(obj)[as.character(obj$seurat_clusters) %in% candidate_clusters]
 if (length(candidate_cells) < 100) stop("Too few candidate T/NK cells: ", length(candidate_cells))
 
+# 【取细胞子集】按 cells 或条件保留需要的细胞；这一步改变本次分析范围，要同步核对后面的分母。
 tnk <- subset(obj, cells = candidate_cells)
+# 【子集重分析】对子集重新标准化、选择高变基因和降维，使 T/NK 内部差异更易分辨。
 # Reprocess subset
 message("Reclustering candidate T/NK cells: ", ncol(tnk))
+# 【标准化】默认 LogNormalize 将每个细胞按总计数缩放再取 log1p，减少测序深度差异的影响。
 tnk <- NormalizeData(tnk, verbose = FALSE)
+# 【高变基因】选择细胞间变化较大的基因用于降维，nfeatures 控制数量；不等于删掉其他基因的原始表达。
 tnk <- FindVariableFeatures(tnk, nfeatures = tnk_n_variable, verbose = FALSE)
+# 【缩放】对用于分析的基因做中心化/标准化，使不同基因更便于进入 PCA；具体基因由 features 指定。
 tnk <- ScaleData(tnk, verbose = FALSE)
+# 【PCA】把大量基因的变化压缩成主成分；npcs 是计算数量，后续 dims 决定实际使用哪些。
 tnk <- RunPCA(tnk, npcs = tnk_n_pcs, verbose = FALSE)
+# 【邻居图】在选定主成分空间中寻找表达相似的细胞，为图聚类提供连接关系。
 tnk <- FindNeighbors(tnk, dims = tnk_use_dims, verbose = FALSE)
+# 【聚类】利用邻居图划分细胞群；resolution 越大通常分得越细，编号本身没有生物学身份。
 tnk <- FindClusters(tnk, resolution = tnk_resolution, verbose = FALSE)
+# 【UMAP】将表达相似性压缩到低维便于展示；二维距离不能解释为组织空间距离。
 tnk <- RunUMAP(tnk, dims = tnk_use_dims, verbose = FALSE)
 tnk$tnk_subcluster <- as.character(Idents(tnk))
 
@@ -414,13 +495,18 @@ sub_scores <- do.call(rbind, lapply(sub_ids, function(sc) {
   )
 }))
 
+# 【参考阈值】用当前子聚类评分的中位数/分位数设置规则；这些是本批数据的相对阈值。
 # Global thresholds from subcluster means (conservative)
 med_nk <- stats::median(sub_scores$mean_nk_score, na.rm = TRUE)
 med_t <- stats::median(sub_scores$mean_t_score, na.rm = TRUE)
 med_ex <- stats::median(sub_scores$mean_exclude, na.rm = TRUE)
 q75_ex <- as.numeric(stats::quantile(sub_scores$mean_exclude, 0.75, na.rm = TRUE))
 
+# 【函数：assign_subcluster_label】综合 T、NK 和排除标志的群均值，给子聚类分配初步精细标签。
+# 规则依次判断污染、明确 NK、明确 T 和不确定群；后面还有逐细胞修正。
+# 【注释规则】先检查污染标志，再比较 T 与 NK 核心标志；不是看到 NKG7 就直接认定 NK。
 assign_subcluster_label <- function(row) {
+  # 【污染候选】排除标志较高且 T/NK 核心标志弱时，优先标记为其他/污染，保留后续复核空间。
   # Contaminant if exclusion markers dominate and lymphoid scores weak
   if (is.finite(row$mean_exclude) && row$mean_exclude >= q75_ex &&
       row$mean_core_nk < med_nk && row$mean_core_t < med_t) {
@@ -430,15 +516,18 @@ assign_subcluster_label <- function(row) {
   t_high <- row$mean_t_score >= med_t && row$mean_core_t >= med_t * 0.9
   nk_pref <- row$mean_nk_minus_t >= score_delta
   t_pref <- row$mean_t_minus_nk >= score_delta
+  # 【高置信 NK】同时要求 NK 特征高、相对 T 特征占优，且 CD3/TCR 相关特征不过高。
   # High-confidence NK: NK markers high, TCR/CD3 axis not co-high
   if (nk_high && nk_pref && row$mean_core_t < row$mean_core_nk &&
       row$mean_core_t <= med_t) {
     return("NK_cell")
   }
+  # 【明确 T】T 标志与相对偏好满足条件时归 T；不凭单个细胞毒基因判断。
   # Clear T
   if (t_high && t_pref && row$mean_core_t > row$mean_core_nk) {
     return("T_cell")
   }
+  # 【保留不确定性】T 与 NK 同时较高或无法清晰区分时，优先保留 T_NK_ambiguous 标签。
   # Both high or unclear
   if (nk_high && t_high) return("T_NK_ambiguous")
   if (nk_high && !t_pref) return("T_NK_ambiguous")
@@ -446,6 +535,7 @@ assign_subcluster_label <- function(row) {
   "T_NK_ambiguous"
 }
 
+# 【固定返回类型】vapply 与 lapply 类似，但需要指定每次返回的类型和长度，便于尽早发现不一致。
 sub_scores$subcluster_refined_label <- vapply(seq_len(nrow(sub_scores)), function(i) {
   assign_subcluster_label(sub_scores[i, ])
 }, character(1))
@@ -467,6 +557,7 @@ q90_ex_cell <- as.numeric(stats::quantile(cell_ex, 0.90, na.rm = TRUE))
 
 refined <- tnk$refined_celltype
 # Promote only clear NK cells if subcluster was ambiguous but cell is NK-like
+# 【逐细胞修正】从子聚类标签出发，用单细胞的 T/NK 核心分数修正不确定标签。
 promote_nk <- refined == "T_NK_ambiguous" &
   cell_core_nk > cell_core_t + score_delta &
   cell_nk >= med_cell_nk &
@@ -482,6 +573,7 @@ contam <- cell_ex >= q90_ex_cell & cell_core_nk < med_cell_nk & cell_core_t < me
 refined[promote_nk] <- "NK_cell"
 refined[demote_nk] <- "T_NK_ambiguous"
 refined[contam] <- "Other_or_contaminant"
+# 【最终 NK 约束】还要满足逐细胞核心 NK 高于核心 T，且 NK 分数达到设定门槛。
 # Final high-confidence NK: require core NK > core T and NK score above median
 final_nk_ok <- refined == "NK_cell" & cell_core_nk > cell_core_t & cell_nk >= med_cell_nk
 refined[refined == "NK_cell" & !final_nk_ok] <- "T_NK_ambiguous"
@@ -493,6 +585,7 @@ tnk$analysis_celltype[tnk$refined_celltype != "NK_cell" & tnk$refined_celltype !
   ifelse(tnk$refined_celltype[tnk$refined_celltype != "NK_cell" & tnk$refined_celltype != "T_cell"] ==
            "Other_or_contaminant", "Other_or_contaminant", "T_NK_ambiguous")
 
+# 【回填原对象】把子集的新标签按细胞名写回完整对象；未进入候选集的细胞另行保留原标签。
 # Transfer to full object
 obj$tnk_subcluster <- NA_character_
 obj$t_score <- NA_real_
@@ -515,6 +608,7 @@ obj$refined_celltype[common] <- tnk$refined_celltype[common]
 # - non-candidate: legacy manual (but force legacy NK clusters not in refined NK -> T_cell or keep non-NK)
 obj$analysis_celltype <- as.character(obj$legacy_manual_celltype)
 obj$analysis_celltype[common] <- tnk$refined_celltype[common]
+# 【旧标签处理】没有通过新 NK 规则的细胞，不能仅因为旧聚类曾叫 NK 就继续保留 NK_cell。
 # Never keep legacy NK label for cells that failed high-confidence NK
 legacy_nk_mask <- as.character(obj$seurat_clusters) %in% old_nk_clusters
 not_new_nk <- obj$analysis_celltype != "NK_cell"
@@ -524,6 +618,7 @@ obj$analysis_celltype[legacy_nk_mask & not_new_nk & obj$refined_celltype == "Not
 obj$analysis_celltype[obj$legacy_manual_celltype == tumor_epithelial_celltype_label &
                         obj$refined_celltype == "Not_in_TNK_candidate"] <- tumor_epithelial_celltype_label
 
+# 【逐细胞导出】保留旧标签、新标签与条形码，方便追溯每个细胞的注释来源。
 # Cell-level annotation export
 cell_annot <- data.frame(
   cell = colnames(obj),
@@ -542,9 +637,11 @@ cell_annot <- data.frame(
 )
 write.csv(cell_annot, file.path(stage1_dir, "refined_celltype_annotation_by_cell.csv"), row.names = FALSE)
 
+# 【旧群到新类型】汇总各原聚类被拆分到新类型的数量，观察是否存在混合群。
 # By original cluster summary
 by_cluster <- do.call(rbind, lapply(cluster_ids, function(cl) {
   idx <- as.character(obj$seurat_clusters) == cl
+  # 【类别顺序】factor 把文本变成类别；levels 控制图表顺序，也可能影响模型参考组。
   tab <- table(factor(obj$refined_celltype[idx], levels = c(
     "NK_cell", "T_cell", "T_NK_ambiguous", "Other_or_contaminant", "Not_in_TNK_candidate"
   )))
@@ -563,6 +660,7 @@ by_cluster <- do.call(rbind, lapply(cluster_ids, function(cl) {
 }))
 write.csv(by_cluster, file.path(stage1_dir, "refined_celltype_annotation_by_cluster.csv"), row.names = FALSE)
 
+# 【检查样本来源】统计各子聚类来自哪些样本，判断是否主要由单一样本贡献。
 # Subcluster counts by sample
 sub_sample <- as.data.frame(table(
   sample = tnk$sample,
@@ -575,6 +673,8 @@ write.csv(sub_sample, file.path(stage1_dir, "tnk_subcluster_counts_by_sample.csv
 # Plots
 write_plot(
   file.path(stage1_dir, "umap_tnk_subclusters.pdf"),
+  # 【读图】DimPlot 按类别上色，FeaturePlot 按连续表达上色；DotPlot 的点大小通常是检出比例、颜色是平均表达。
+  # 若使用了缩放，颜色表示相对值；本次图的具体分组以 group.by/Idents 为准。
   DimPlot(tnk, group.by = "tnk_subcluster", label = TRUE) + ggtitle("T/NK candidate subclusters"),
   width = 8, height = 6
 )
@@ -606,6 +706,7 @@ if (length(plot_genes) > 0) {
   )
 }
 
+# 【阶段验收】综合 T/NK 标志、数量与样本分布，记录是否满足进入下游的条件。
 # QC summary / acceptance
 high_nk_cells <- colnames(obj)[obj$analysis_celltype == "NK_cell"]
 high_t_cells <- colnames(obj)[obj$analysis_celltype == "T_cell"]
@@ -614,6 +715,8 @@ t_compare_cells <- colnames(obj)[obj$refined_celltype == "T_cell" |
                                    (obj$analysis_celltype == "T_cell" & obj$refined_celltype == "Not_in_TNK_candidate")]
 if (length(t_compare_cells) < 20) t_compare_cells <- high_t_cells
 
+# 【函数：split_cluster】统计旧聚类 cl 被新注释分成了多少 NK/T/不确定/污染细胞。
+# 用于检查新旧标签差异，不会在这里重新聚类。
 split_cluster <- function(cl) {
   idx <- as.character(obj$seurat_clusters) == cl
   tab <- table(factor(obj$refined_celltype[idx], levels = c(
@@ -643,6 +746,7 @@ nk_by_sample <- do.call(rbind, lapply(sort(unique(obj$sample)), function(s) {
   )
 }))
 
+# 【身份质控】要求最终 NK 的 CD3/TCR 相关表达低于 T，NK 核心标志高于对照；后面汇总是否通过。
 stage1_pass_cd3 <- is.finite(nk_cd3) && is.finite(t_cd3) && nk_cd3 < t_cd3
 stage1_pass_nkmark <- is.finite(nk_cyto) && is.finite(t_cyto) && nk_cyto > t_cyto
 stage1_pass_n <- length(high_nk_cells) >= 50
@@ -692,6 +796,7 @@ for (i in seq_len(nrow(nk_by_sample))) {
 write.csv(qc_df, file.path(stage1_dir, "tnk_refinement_qc_summary.csv"), row.names = FALSE)
 write.csv(nk_by_sample, file.path(stage1_dir, "high_confidence_nk_by_sample.csv"), row.names = FALSE)
 
+# 【保存中间对象】保存完整 R 对象供后续继续分析；RDS 需用 readRDS 读取，不能当 CSV 打开。
 saveRDS(obj, file.path(stage1_dir, "refined_merged_object.rds"))
 # Also keep tnk subset for debugging
 saveRDS(tnk, file.path(stage1_dir, "tnk_candidate_subcluster_object.rds"))
@@ -708,6 +813,7 @@ if (!stage1_pass) {
 } # end stage_start < 2 (full stage 1)
 
 # ============================================================
+# 【阶段 2】沿用通过质控的新身份标签，重新进行 STK31 分组、差异与候选通讯分析。
 # STAGE 2: NK downstream with refined labels
 # ============================================================
 if (stage_start > 2) {
@@ -731,10 +837,12 @@ epi_assign <- assign_tumor_epithelial_stk31_group(
 )
 obj$tumor_epithelial_stk31_group <- epi_assign$group
 
+# 【敏感性分析】换用不同 STK31 阳性/高表达定义，查看细胞集合和后续结果是否改变。
 # Sensitivity definitions
 epi_idx <- obj$analysis_celltype == tumor_epithelial_celltype_label
 epi_cells <- colnames(obj)[epi_idx]
 # 1) counts > 0 on data layer already >0 approx; also try counts layer if available
+# 【错误分支】尝试运行代码，失败时进入 error 函数；应阅读返回值，区分正常结果与跳过/失败说明。
 stk31_counts <- tryCatch({
   as.numeric(fetch_gene_matrix(obj, target_gene, slot = "counts")[target_gene, ])
 }, error = function(e) stk31_expr)
@@ -780,6 +888,7 @@ write.csv(sens, file.path(stage2_dir, "stk31_definition_sensitivity.csv"), row.n
 high_cells <- colnames(obj)[obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"]
 low_cells <- colnames(obj)[obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"]
 nk_cells <- colnames(obj)[obj$analysis_celltype == "NK_cell"]
+# 【集合差集】setdiff(a,b) 返回 a 中不属于 b 的元素，用于找缺失基因或定义比较的另一组。
 other_cells <- setdiff(colnames(obj), nk_cells)
 
 analysis_summary <- data.frame(
@@ -803,6 +912,7 @@ analysis_summary <- data.frame(
 )
 write.csv(analysis_summary, file.path(stage2_dir, "analysis_summary.csv"), row.names = FALSE)
 
+# 【新旧 NK 重叠】对比旧候选与高置信 NK 的细胞集合，说明细化注释保留或排除了哪些细胞。
 # Old vs refined NK overlap
 overlap <- data.frame(
   cell = colnames(obj),
@@ -843,6 +953,7 @@ pathway_summary <- aggregate(interaction_score ~ direction + pathway, data = lr_
 pathway_summary <- pathway_summary[order(-pathway_summary$interaction_score), ]
 write.csv(pathway_summary, file.path(stage2_dir, "candidate_pathway_summary.csv"), row.names = FALSE)
 
+# 【样本摘要】每个样本分别计算上皮 STK31 与 NK 相关指标，避免把细胞数量误当样本数量。
 # Sample-level STK31-NK relationship
 sample_rel <- do.call(rbind, lapply(sort(unique(as.character(obj$sample))), function(s) {
   idx <- obj$sample == s
@@ -860,6 +971,7 @@ sample_rel <- do.call(rbind, lapply(sort(unique(as.character(obj$sample))), func
 }))
 write.csv(sample_rel, file.path(stage2_dir, "sample_level_stk31_nk_relationship.csv"), row.names = FALSE)
 
+# 【NK 功能摘要】只对高置信 NK 按样本汇总基因集平均表达；分数是表达代理指标。
 # NK function scores by sample (high-conf NK only)
 for (score_name in names(nk_function_sets)) {
   obj[[paste0("score_", score_name)]] <- module_score(obj, nk_function_sets[[score_name]])
@@ -916,6 +1028,7 @@ if (length(nk_cells) > 0) {
 if (nrow(nk_scores_by_sample) > 0) {
   write_plot(
     file.path(stage2_dir, "nk_function_scores_by_sample.pdf"),
+    # 【ggplot 图层】aes 把表格列映射到坐标/颜色/大小，后面的 + 逐层加入点、线、主题和标签。
     ggplot(nk_scores_by_sample, aes(x = sample, y = mean_score, fill = score_name)) +
       geom_col(position = "dodge") + theme_bw() +
       ggtitle("NK function module scores (high-confidence NK)") +
@@ -928,9 +1041,11 @@ message("Stage 2 done")
 } # end stage 2
 
 # ============================================================
+# 【阶段 3】在冻结的细胞身份上推断通讯，比较 high/low 上皮与 NK 的两个方向。
 # STAGE 3: CellChat high vs low differential
 # ============================================================
 message("=== STAGE 3: CellChat high-vs-low ===")
+# 【续跑检查】若跳过前两个阶段，需要从已有对象恢复本阶段所需的 STK31 标签。
 # Ensure STK31 groups exist if resumed into stage 3 only
 if (!"tumor_epithelial_stk31_group" %in% colnames(obj@meta.data)) {
   stk31_expr <- as.numeric(fetch_gene_matrix(obj, target_gene)[target_gene, ])
@@ -958,6 +1073,7 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
     options(future.globals.maxSize = 8 * 1024^3)
   }
 
+  # 【通讯分组】将 STK31-high、low 上皮和 NK 等定义为 CellChat 的发送/接收群。
   # Build cellchat groups
   obj$cellchat_group <- as.character(obj$analysis_celltype)
   obj$cellchat_group[obj$tumor_epithelial_stk31_group == "STK31_high_tumor_epithelial"] <-
@@ -965,12 +1081,14 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
   obj$cellchat_group[obj$tumor_epithelial_stk31_group == "STK31_low_tumor_epithelial"] <-
     "STK31_low_tumor_epithelial"
   obj$cellchat_group[obj$analysis_celltype == "NK_cell"] <- "NK_cell"
+  # 【合并稀少类别】将部分不确定类型汇总，避免大量小群干扰通讯输入；以代码中的映射为准。
   # Collapse rare ambiguous labels
   obj$cellchat_group[obj$cellchat_group %in% c("T_NK_ambiguous", "Other_or_contaminant", "Unassigned")] <-
     "Other_immune_or_unassigned"
 
   group_counts <- sort(table(obj$cellchat_group), decreasing = TRUE)
   keep_groups <- names(group_counts[group_counts >= min_cells_per_cellchat_group])
+  # 【关键群纳入】核心比较群也必须满足最少细胞数要求，不能仅为了画图而忽略阈值。
   # Always try to keep key groups if present with enough cells
   key_groups <- c("STK31_high_tumor_epithelial", "STK31_low_tumor_epithelial", "NK_cell")
   for (kg in key_groups) {
@@ -986,6 +1104,7 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
 
   cells_by_group <- split(colnames(cc_obj), cc_obj$cellchat_group)
   keep_cells <- unlist(lapply(cells_by_group, function(cells) {
+    # 【抽样】从候选集合抽取元素；replace=TRUE 是有放回抽样，同一个细胞可能重复出现。
     if (length(cells) > max_cells_per_cellchat_group) sample(cells, max_cells_per_cellchat_group) else cells
   }), use.names = FALSE)
   cc_obj <- subset(cc_obj, cells = keep_cells)
@@ -1006,21 +1125,29 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
   message("Running CellChat (this may take a while)")
   data_input <- fetch_gene_matrix(cc_obj, rownames(cc_obj), slot = "data")
   meta <- data.frame(labels = cc_obj$cellchat_group, row.names = colnames(cc_obj), stringsAsFactors = FALSE)
+  # 【通讯输入】表达矩阵列名与 meta 行名必须对应；group.by 指定用哪个标签定义发送和接收细胞群。
   cellchat <- CellChat::createCellChat(object = data_input, meta = meta, group.by = "labels")
   cellchat@DB <- CellChat::CellChatDB.human
   cellchat <- CellChat::subsetData(cellchat)
+  # 【通讯候选筛选】先找群中高表达的基因，再通过配体受体数据库筛选候选相互作用。
   cellchat <- CellChat::identifyOverExpressedGenes(cellchat)
   cellchat <- CellChat::identifyOverExpressedInteractions(cellchat)
+  # 【通讯推断】根据群表达与配体受体库估计通讯分值；raw.use=TRUE 指未投影的表达，不等于原始 counts。
   cellchat <- CellChat::computeCommunProb(cellchat, raw.use = TRUE)
+  # 【通讯过滤】去掉不满足最少细胞数要求的群的通讯，min.cells 是本次阈值。
   cellchat <- CellChat::filterCommunication(cellchat, min.cells = min_cells_per_cellchat_group)
+  # 【通路汇总】把配体受体层面的通讯聚合到通路层面，再由 aggregateNet 汇总群间网络。
   cellchat <- CellChat::computeCommunProbPathway(cellchat)
   cellchat <- CellChat::aggregateNet(cellchat)
   saveRDS(cellchat, file.path(stage3_dir, "merged_cellchat_object.rds"))
 
+  # 【通讯表】从 CellChat 对象提取 source、target、ligand、receptor、prob 等字段，便于后续筛选与作图。
   communication <- CellChat::subsetCommunication(cellchat)
   write.csv(communication, file.path(stage3_dir, "merged_cellchat_communications.csv"), row.names = FALSE)
 
   # Helper to extract pair probs
+  # 【函数：get_pair_prob】按 source 和 target 从通讯表取出指定方向的全部相互作用行。
+  # 这里不重新计算概率，只筛选已有 prob 数据；没有匹配时返回空表。
   get_pair_prob <- function(comm, source, target) {
     sub <- comm[comm$source == source & comm$target == target, , drop = FALSE]
     if (nrow(sub) == 0) return(sub)
@@ -1033,6 +1160,8 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
   nk_to_low <- get_pair_prob(communication, "NK_cell", "STK31_low_tumor_epithelial")
 
   # Aggregate L-R level
+  # 【函数：make_diff_table】将 high 与 low 通讯按通路/配体/受体键对齐，计算差值、比值并标记方向。
+  # 返回的是两种上下文的描述性对照；不能把差值本身当作差异通讯的统计 P 值。
   make_diff_table <- function(high_df, low_df, direction_label) {
     # key by pathway + ligand + receptor if columns exist
     key_cols <- intersect(c("pathway_name", "ligand", "receptor", "interaction_name"), colnames(communication))
@@ -1043,6 +1172,8 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
       }
     }
     # rebuild keys safely
+    # 【函数：add_key】统一通路字段名称，再把通路、配体、受体拼成键，用来匹配 high/low 两张表。
+    # 缺少字段时使用当前代码的占位名称；空表返回空键。
     add_key <- function(df) {
       if (nrow(df) == 0) {
         df$key <- character(0)
@@ -1112,10 +1243,13 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
   }
   write.csv(nk_to_high_low, file.path(stage3_dir, "nk_to_high_vs_low_cellchat_diff.csv"), row.names = FALSE)
 
+  # 【机制轴对照】将相关配体受体归为候选轴，比较 high/low 上下文中的汇总通讯值。
   # Mechanism axis comparison
   axis_rows <- list()
   for (axis_name in names(mechanism_axes)) {
     genes <- mechanism_axes[[axis_name]]
+    # 【函数：pick_axis】按机制基因及通路名称匹配相关通讯，分别加总传入的两列概率。
+    # 这是基于名称规则的候选轴归类，需留意宽泛关键词可能包含的相互作用。
     pick_axis <- function(df, prob_col1, prob_col2) {
       if (nrow(df) == 0) return(c(0, 0))
       hit <- grepl(paste(genes, collapse = "|"), paste(df$ligand, df$receptor, df$pathway_name), ignore.case = TRUE)
@@ -1156,6 +1290,7 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
   axis_df <- do.call(rbind, axis_rows)
   write.csv(axis_df, file.path(stage3_dir, "mechanism_axis_high_low_comparison.csv"), row.names = FALSE)
 
+  # 【HLA 专项核查】专门检查 MHC-I/HLA 相关相互作用，避免仅依靠通路总分解释机制。
   # MHC-I special check
   if (nrow(high_low_to_nk) > 0) {
     mhc_hit <- grepl("MHC-I|HLA|KIR", high_low_to_nk$pathway_name, ignore.case = TRUE) |
@@ -1235,6 +1370,7 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
     width = 10, height = 5
   )
 
+  # 【高低组热图】展示重点配体受体在两种上下文的分数；缺失和零值的处理见构表代码。
   # Heatmap of top pairs high vs low
   if (nrow(high_low_to_nk) > 0 && requireNamespace("pheatmap", quietly = TRUE)) {
     top <- head(high_low_to_nk[order(-pmax(high_low_to_nk$prob_high_to_nk, high_low_to_nk$prob_low_to_nk)), ], 30)
@@ -1269,6 +1405,7 @@ if (!requireNamespace("CellChat", quietly = TRUE)) {
     )
   }
 
+  # 【圆形网络】节点是细胞群，连线编码通讯数量或强度；先看调用的网络矩阵和图例。
   # Optional circle plots
   if (!is.null(cellchat@net$count)) {
     group_size <- as.numeric(table(cellchat@idents))

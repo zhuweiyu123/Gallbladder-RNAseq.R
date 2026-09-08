@@ -1,4 +1,15 @@
 #!/usr/bin/env python3
+# ========================================================================
+# 【中文阅读指南】用已有 CSV 制作 WNT 与 STK31/HLA 专题图
+# 输入：脚本 16 的 WNT 汇总、脚本 07 的样本候选轴表、脚本 11 的恶性上皮高低差异表。
+# 流程：pandas 读表和筛选 → Pillow 在画布上绘制 → 保存 PNG/PDF 及对应绘图数据。
+# 输出：results/stk31_wnt_hla_focused_figures；字体使用 Windows 的 Arial 路径。
+# 图 2 的样本面板来自旧 refined 上皮定义，基因面板来自 CNV 恶性上皮定义，两者数据范围不同。
+# 这份脚本负责展示既有统计结果；标题和样本展示顺序是固定文本，换数据时需重新核对。
+# Python 入门：def 定义函数；缩进表示代码归属；字典保存键值对；Path 管理文件路径。
+# 先读顶部输入路径与函数说明，再看文件末尾入口；不要把图中文字当作自动生成的统计结论。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 """Create two focused, publication-ready figures from existing analysis outputs.
 
 Figure 1: WNT CellChat source-target probabilities in datasets with detected WNT.
@@ -14,9 +25,11 @@ import math
 from pathlib import Path
 
 import pandas as pd
+# 【图像工具包】Pillow 提供画布、文字和线条操作；这里按像素排版，最终保存成图片。
 from PIL import Image, ImageDraw, ImageFont
 
 
+# 【项目根目录】后面的输入输出路径以此为起点；相对脚本定位与写死本机路径的可移植性不同。
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 OUT_DIR = PROJECT_DIR / "results" / "stk31_wnt_hla_focused_figures"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,15 +59,20 @@ FONT_REGULAR = Path(r"C:\Windows\Fonts\arial.ttf")
 FONT_BOLD = Path(r"C:\Windows\Fonts\arialbd.ttf")
 
 
+# 【函数：font】按 size 和 bold 读取 Arial 常规/粗体字体；返回 Pillow 绘字需要的字体对象。
+# 字体路径在文件顶部配置，文件不存在会在加载时报错。
 def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(str(FONT_BOLD if bold else FONT_REGULAR), size=size)
 
 
+# 【函数：save_png_pdf】将 Pillow 画布保存为 PNG，再转 RGB 保存 PDF；输出分辨率设为 320 dpi。
+# 这个 PDF 包含栅格图片，放大时不会变成可无限缩放的矢量图。
 def save_png_pdf(image: Image.Image, stem: Path) -> None:
     image.save(stem.with_suffix(".png"), dpi=(320, 320), optimize=True)
     image.convert("RGB").save(stem.with_suffix(".pdf"), "PDF", resolution=320)
 
 
+# 【函数：draw_centered】先测量文字边界，再偏移起点，让文字在给定 xy 附近居中。
 def draw_centered(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str,
                   text_font: ImageFont.FreeTypeFont, fill: str = "#111827") -> None:
     box = draw.textbbox((0, 0), text, font=text_font)
@@ -62,12 +80,14 @@ def draw_centered(draw: ImageDraw.ImageDraw, xy: tuple[float, float], text: str,
               text, font=text_font, fill=fill)
 
 
+# 【函数：draw_rotated_text】先在透明小画布上写文字，再旋转并贴到主图，用于竖排轴标签。
 def draw_rotated_text(image: Image.Image, center: tuple[int, int], text: str,
                       text_font: ImageFont.FreeTypeFont, angle: float,
                       fill: str = "#374151") -> None:
     box = text_font.getbbox(text)
     width = box[2] - box[0] + 30
     height = box[3] - box[1] + 30
+    # 【像素画布】width/height 指像素；RGBA 有透明通道，draw 负责在画布上添加元素。
     layer = Image.new("RGBA", (width, height), (255, 255, 255, 0))
     layer_draw = ImageDraw.Draw(layer)
     layer_draw.text((15 - box[0], 15 - box[1]), text, font=text_font, fill=fill)
@@ -76,6 +96,8 @@ def draw_rotated_text(image: Image.Image, center: tuple[int, int], text: str,
                                     int(center[1] - rotated.height / 2)))
 
 
+# 【函数：interpolate_color】按 value 在相邻颜色节点之间插值，生成连续颜色梯度。
+# 颜色只是数值编码，具体编码哪个指标以调用处为准。
 def interpolate_color(stops: list[tuple[float, str]], value: float) -> str:
     value = max(0.0, min(1.0, value))
     for idx in range(len(stops) - 1):
@@ -89,8 +111,12 @@ def interpolate_color(stops: list[tuple[float, str]], value: float) -> str:
     return stops[-1][1]
 
 
+# 【函数：make_wnt_figure】读取 WNT 汇总表，按预设样本和细胞类型筛选发送/接收组合，再绘制网络图。
+# 先保存实际绘图 CSV，便于从图追溯数据；样本候选顺序在函数中明确列出。
 def make_wnt_figure() -> None:
+    # 【读表】pandas 将 CSV 转成 DataFrame；后续用列名选择指标，用布尔条件筛选需要的行。
     data = pd.read_csv(WNT_INPUT)
+    # 【数值转换】无法解析的文本在 errors="coerce" 下变成 NaN；后续 fillna(0) 会把缺失按零处理。
     data["probability"] = pd.to_numeric(data["probability"], errors="coerce").fillna(0.0)
     detected = (
         data.groupby("dataset", as_index=False)["probability"]
@@ -98,6 +124,7 @@ def make_wnt_figure() -> None:
         .query("probability > 0")["dataset"]
         .tolist()
     )
+    # 【固定展示范围】仅从这里列出的 tissue1/2/5 中选已检出 WNT 的数据集，其他样本不会自动加入。
     dataset_order = [x for x in ["tissue1", "tissue2", "tissue5"] if x in detected]
     group_order = [
         "Malignant epithelial cells",
@@ -110,6 +137,7 @@ def make_wnt_figure() -> None:
         & data["source"].isin(group_order)
         & data["target"].isin(group_order)
     ].copy()
+    # 【绘图数据留档】导出实际用于图中的子表；index=False 避免额外写入 DataFrame 行索引。
     plot_data.to_csv(OUT_DIR / "Figure1_WNT_plot_data.csv", index=False)
 
     width, height = 3600, 1850
@@ -213,7 +241,10 @@ def make_wnt_figure() -> None:
     save_png_pdf(image, OUT_DIR / "Figure1_WNT_source_target_network")
 
 
+# 【函数：make_hla_figure】分别读取样本候选轴表和恶性上皮差异表，绘制 HLA 的样本与基因面板。
+# 两种输入来自不同分析定义；先保存各自绘图数据再排版，避免混淆统计单位。
 def make_hla_figure() -> None:
+    # 【样本面板来源】这里读取脚本 07 的 refined 上皮候选轴摘要；与后面的 CNV 恶性上皮差异表不是同一细胞集合。
     sample_data = pd.read_csv(HLA_SAMPLE_INPUT)
     sample_data = sample_data[sample_data["axis"] == "MHC-I/HLA_epi_to_NK"].copy()
     sample_columns = [
@@ -225,6 +256,7 @@ def make_hla_figure() -> None:
     sample_data = sample_data[sample_columns]
     sample_data.to_csv(OUT_DIR / "Figure2_STK31_HLA_sample_plot_data.csv", index=False)
 
+    # 【基因面板来源】这里读取脚本 11 的 CNV 恶性上皮 high/low 差异结果，保留原有 P 值和 fold change。
     gene_data = pd.read_csv(HLA_GENE_INPUT)
     hla_genes = ["HLA-A", "HLA-B", "HLA-C", "HLA-E", "HLA-F"]
     gene_data = gene_data[gene_data["gene"].isin(hla_genes)].copy()
@@ -337,6 +369,7 @@ def make_hla_figure() -> None:
     save_png_pdf(image, OUT_DIR / "Figure2_STK31_HLA_relationship")
 
 
+# 【函数：write_readme】将专题图的数据来源与解读说明写到结果目录，和图片一起保存。
 def write_readme() -> None:
     text = """Focused WNT and STK31-HLA figures
 ==================================
@@ -358,6 +391,7 @@ Each figure is supplied as PNG and PDF. Exact plot data are supplied as CSV.
     (OUT_DIR / "README.txt").write_text(text, encoding="utf-8")
 
 
+# 【脚本入口】直接运行本文件时执行下面的主函数；作为模块导入时不自动执行这段入口。
 if __name__ == "__main__":
     make_wnt_figure()
     make_hla_figure()

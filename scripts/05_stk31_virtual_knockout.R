@@ -1,9 +1,26 @@
+# ========================================================================
+# 【中文阅读指南】STK31 虚拟敲除与候选方向探索
+# 输入：四样本合并对象和 cluster_celltype_annotation.csv；只取注释为 Epithelial 的细胞。
+# 流程：筛选网络基因 → scTenifoldKnk 虚拟移除 STK31 出边 → 匹配阳性/阴性细胞估计方向 → 排序。
+# 输出：默认 results/merged_stk31_virtual_knockout；包含网络对象、扰动表、方向预测和稳定性图表。
+# STK31-positive 在这里指原始 counts > 0；STK31_KO_* 环境变量可控制规模、重复次数和输出目录。
+# 网络 distance 表示扰动幅度，不自带上调/下调方向；方向来自另一个观察性匹配模型。
+# 预测变化取 -(阳性组 - 匹配阴性组)，是用于提出实验假设的近似，并非真实敲除后的测量值。
+# 若 STK31 在推断网络中没有出边，脚本会标记网络结果不可解释；不能把零扰动当作无生物学作用。
+# 阅读顺序：文件开头的路径/参数 → 工具函数 → 主流程；函数定义本身不会执行分析。
+# R 入门：<- 是赋值；$ 取一列/一个成员；[行,列] 取子集；c() 建向量；list() 装不同类型对象。
+# NA 表示缺失，不等于 0；counts 是原始计数，data 通常是 log 标准化表达。
+# 运行环境：本项目默认在 Linux 服务器 /home/zhuweiyu/codex-r 下用 Rscript 运行。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
+# 【加载依赖】library 加载本脚本用到的包；外层只隐藏启动提示，不会安装缺失的包。
 suppressPackageStartupMessages({
   library(Seurat)
   library(Matrix)
   library(ggplot2)
 })
 
+# 【可重复性】固定随机数起点，使同一环境下的抽样/随机算法更易复现；不同包版本仍可能产生差异。
 set.seed(20260714)
 
 # 固定远程服务器项目路径；本脚本默认在 /home/zhuweiyu/codex-r 上运行。
@@ -16,24 +33,34 @@ annotation_file <- file.path(
   project_dir,
   "results/merged_stk31_nk_analysis/cluster_celltype_annotation.csv"
 )
+# 【可调参数】Sys.getenv 先读环境变量，未设置时使用代码中的默认值；as.integer/as.numeric 把文本转为数值。
 out_dir <- Sys.getenv(
   "STK31_KO_OUT_DIR",
   file.path(project_dir, "results/merged_stk31_virtual_knockout")
 )
+# 【输出目录】recursive=TRUE 可连同父目录一起建立；路径变量决定结果实际写到哪里。
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 target_gene <- "STK31"
 epithelial_label <- "Epithelial"
+# 【参数 max_genes】虚拟敲除网络允许的基因规模目标；规模越大通常越耗内存和时间。
 max_genes <- as.integer(Sys.getenv("STK31_KO_MAX_GENES", "1500"))
+# 【参数 n_networks】构建的网络重复数量，用于网络估计；增加会延长运行时间。
 n_networks <- as.integer(Sys.getenv("STK31_KO_NETWORKS", "10"))
+# 【参数 n_network_cells】每次网络构建所抽取的细胞数量，上限还会受可用细胞数限制。
 n_network_cells <- as.integer(Sys.getenv("STK31_KO_NETWORK_CELLS", "1000"))
+# 【参数 n_bootstrap】方向模型的 bootstrap 重复次数；增加可改善重采样精度，但不增加独立样本数。
 n_bootstrap <- as.integer(Sys.getenv("STK31_KO_BOOTSTRAP", "100"))
+# 【参数 n_cores】并行核心数，应与服务器资源配置相匹配。
 n_cores <- as.integer(Sys.getenv("STK31_KO_CORES", "4"))
+# 【参数 min_gene_pct】网络候选基因的最低检测细胞比例；0.01 即 1%，另结合最低细胞数规则。
 min_gene_pct <- as.numeric(Sys.getenv("STK31_KO_MIN_GENE_PCT", "0.01"))
+# 【参数 reuse_network】是否复用已有网络对象；复用前要确认旧对象来自相同输入和网络配置。
 reuse_network <- tolower(Sys.getenv("STK31_KO_REUSE_NETWORK", "false")) == "true"
 
 required_packages <- c("scTenifoldKnk")
 missing_packages <- required_packages[
+  # 【固定返回类型】vapply 与 lapply 类似，但需要指定每次返回的类型和长度，便于尽早发现不一致。
   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
 ]
 if (length(missing_packages) > 0) {
@@ -67,6 +94,8 @@ mechanism_sets <- list(
 )
 
 # 兼容 Seurat v4/v5：v5 使用 layer，旧版本使用 slot。
+# 【函数：get_assay_matrix】按 SeuratObject 版本选择 layer 或 slot 参数，从 RNA assay 取指定矩阵。
+# 网络输入使用 counts；画图或评分可使用标准化表达，具体由调用处决定。
 get_assay_matrix <- function(object, layer) {
   if (utils::packageVersion("SeuratObject") >= "5.0.0") {
     GetAssayData(object, assay = "RNA", layer = layer)
@@ -75,13 +104,18 @@ get_assay_matrix <- function(object, layer) {
   }
 }
 
+# 【函数：write_plot】把传入的绘图对象写到指定文件；width、height 控制版面大小。
+# 将画图与保存封装起来，可以让同一套输出保持一致尺寸。
 write_plot <- function(filename, plot, width = 8, height = 6) {
+  # 【保存图形】输出格式由扩展名决定；width/height 默认按英寸，dpi 主要影响位图清晰度。
   ggsave(
     filename = file.path(out_dir, filename), plot = plot,
     width = width, height = height, units = "in"
   )
 }
 
+# 【函数：scale_numeric】把数值转为标准化分数，便于不同量纲的指标组合。
+# 没有变化或有效值不足时返回零，避免标准差为零引起异常。
 scale_numeric <- function(x) {
   x <- as.numeric(x)
   if (length(unique(x[is.finite(x)])) < 2) return(rep(0, length(x)))
@@ -89,6 +123,8 @@ scale_numeric <- function(x) {
 }
 
 # 将原始 counts 转为 log-normalized 表达矩阵；这里不做表达插补。
+# 【函数：make_log_normalized】将每个细胞的 counts 除以该细胞总计数，再乘 10000 并做 log1p。
+# log1p(x)=log(1+x)，可保留零值；这里没有为未检出的基因补值。
 make_log_normalized <- function(counts) {
   library_size <- Matrix::colSums(counts)
   if (any(library_size <= 0)) stop("Zero-library epithelial cells remain.")
@@ -99,25 +135,32 @@ make_log_normalized <- function(counts) {
 }
 
 # 网络基因 = 检出率足够的高变基因 + 非全零的机制候选基因。
+# 【函数：select_network_genes】从足够多细胞检测到的基因中按表达方差挑选，并优先保留可检测的机制基因。
+# maximum 控制网络规模；稠密网络的内存随基因数增加而快速增长。
 select_network_genes <- function(counts, log_normalized, maximum, required_genes) {
   detected <- Matrix::rowSums(counts > 0)
   minimum_cells <- max(3L, ceiling(ncol(counts) * min_gene_pct))
   eligible <- names(detected)[detected >= minimum_cells]
+  # 【集合交集】intersect 只保留两份名单共有的元素，常用于筛选当前数据真正有的基因/细胞。
   required <- intersect(required_genes, names(detected)[detected > 0])
   eligible <- union(eligible, required)
 
   x <- log_normalized[eligible, , drop = FALSE]
+  # 【按基因求均值】在基因×细胞矩阵中，rowMeans 对每一行跨细胞求平均；若输入是 >0 的逻辑矩阵，得到检出比例。
   gene_mean <- Matrix::rowMeans(x)
   gene_var <- Matrix::rowMeans(x ^ 2) - gene_mean ^ 2
   gene_var[!is.finite(gene_var)] <- 0
   ranked <- names(sort(gene_var, decreasing = TRUE))
 
   variable_slots <- max(0L, maximum - length(required))
+  # 【集合差集】setdiff(a,b) 返回 a 中不属于 b 的元素，用于找缺失基因或定义比较的另一组。
   selected <- unique(c(required, head(setdiff(ranked, required), variable_slots)))
   selected[selected %in% rownames(counts)]
 }
 
 # 在同一样本内，为 STK31 阳性细胞匹配 QC 水平最接近的 STK31 阴性细胞。
+# 【函数：nearest_negative_pool】根据 log1p(UMI数) 和 log1p(基因数) 标准化后的距离，为阳性细胞找最近的阴性候选。
+# 返回每个阳性细胞的候选索引；调用处先限制同一样本，k 控制候选数量。
 nearest_negative_pool <- function(metadata, positive_indices, negative_indices, k = 10L) {
   covariates <- cbind(
     log1p(metadata$nCount_RNA),
@@ -129,6 +172,7 @@ nearest_negative_pool <- function(metadata, positive_indices, negative_indices, 
     (x - mean(x, na.rm = TRUE)) / spread
   })
 
+  # 【批量处理】lapply 对向量/列表的每个元素执行一次函数，返回列表；rbind/do.call 可再把结果按行拼表。
   lapply(positive_indices, function(i) {
     distance <- rowSums((covariates[negative_indices, , drop = FALSE] -
       matrix(covariates[i, ], nrow = length(negative_indices), ncol = 2, byrow = TRUE)) ^ 2)
@@ -139,6 +183,9 @@ nearest_negative_pool <- function(metadata, positive_indices, negative_indices, 
 # 方向预测是观察性匹配分析，不是 scTenifoldKnk 网络敲除结果。
 # 计算方式：预测敲除变化 = -(STK31 阳性细胞 - 匹配阴性细胞)。
 # 只有 bootstrap CI 不跨 0 且 >=75% 样本方向一致时，才给出升高/降低方向。
+# 【函数：estimate_direction】各样本内匹配 STK31 阳性/阴性细胞，以 -(阳性均值-阴性均值) 近似预测敲除方向。
+# 对细胞有放回抽样形成区间，再要求至少 75% 样本方向一致才标记增加/降低。
+# 返回总体预测、逐样本结果和留一结果；这一步独立于网络扰动分析，仍属于观察性探索。
 estimate_direction <- function(expression, metadata, positive, samples, bootstraps) {
   if (!is.null(names(positive))) {
     positive <- positive[colnames(expression)]
@@ -184,6 +231,7 @@ estimate_direction <- function(expression, metadata, positive, samples, bootstra
 
   for (iteration in seq_len(bootstraps)) {
     iteration_effects <- lapply(pools, function(pool) {
+      # 【抽样】从候选集合抽取元素；replace=TRUE 是有放回抽样，同一个细胞可能重复出现。
       selected <- sample(seq_along(pool$positive), length(pool$positive), replace = TRUE)
       pos_idx <- pool$positive[selected]
       neg_idx <- vapply(selected, function(j) {
@@ -245,6 +293,8 @@ estimate_direction <- function(expression, metadata, positive, samples, bootstra
 }
 
 # 给基因标注属于哪个机制集合，方便后续解释 HLA-I、IFN、NK 互作等方向。
+# 【函数：annotate_mechanisms】查询每个基因属于哪些人工机制集合，添加便于阅读的分类标签。
+# 一个基因可能属于多个集合；不在集合中不代表没有生物学功能。
 annotate_mechanisms <- function(genes) {
   vapply(genes, function(gene) {
     labels <- names(mechanism_sets)[vapply(mechanism_sets, function(x) gene %in% x, logical(1))]
@@ -253,9 +303,12 @@ annotate_mechanisms <- function(genes) {
 }
 
 # 当 STK31 网络敲除不可解释时，不做通路富集伪显著性，只汇总机制基因的观察性方向。
+# 【函数：summarize_curated_directions】按人工机制集合汇总预测增加、降低和不确定的基因数量及名称。
+# 汇总依赖前面的方向模型，不是重新进行一轮实验或通路检验。
 summarize_curated_directions <- function(direction_table) {
   output <- lapply(names(mechanism_sets), function(pathway) {
     members <- intersect(mechanism_sets[[pathway]], direction_table$gene)
+    # 【按名称对齐】match(x,y) 返回 x 各元素在 y 中的位置，没找到返回 NA；用来保证标签和表达对应同一细胞。
     selected <- direction_table[match(members, direction_table$gene), , drop = FALSE]
     data.frame(
       pathway = pathway,
@@ -282,13 +335,16 @@ summarize_curated_directions <- function(direction_table) {
 
 # 读取合并后的 Seurat 对象，并接入前面人工整理的 cluster-celltype 注释。
 message("Reading merged Seurat object: ", input_rds)
+# 【读取中间对象】readRDS 恢复之前保存的 R 对象；检查文件路径和对象来自哪一版注释。
 obj <- readRDS(input_rds)
 DefaultAssay(obj) <- "RNA"
 if (utils::packageVersion("SeuratObject") >= "5.0.0") {
+  # 【Seurat v5 数据层】将拆分的数据层合并以供下游读取；这不是批次校正，也不是重新聚类。
   obj <- JoinLayers(obj, assay = "RNA")
 }
 
 if (!file.exists(annotation_file)) stop("Missing annotation file: ", annotation_file)
+# 【读入表格】把已有 CSV/TSV 读入内存；后续列名检查用于确认文件格式符合预期。
 annotation <- read.csv(annotation_file, stringsAsFactors = FALSE)
 cluster_to_celltype <- setNames(
   annotation$manual_celltype,
@@ -299,6 +355,7 @@ obj$manual_celltype[is.na(obj$manual_celltype)] <- "Unassigned"
 
 epithelial_cells <- colnames(obj)[obj$manual_celltype == epithelial_label]
 if (length(epithelial_cells) == 0) stop("No epithelial cells found.")
+# 【取细胞子集】按 cells 或条件保留需要的细胞；这一步改变本次分析范围，要同步核对后面的分母。
 epithelial <- subset(obj, cells = epithelial_cells)
 counts <- get_assay_matrix(epithelial, "counts")
 if (!target_gene %in% rownames(counts)) stop(target_gene, " is absent from RNA counts.")
@@ -345,6 +402,7 @@ if (reuse_network && file.exists(ko_file)) {
     ma_nDim = 2,
     nCores = n_cores
   )
+  # 【保存中间对象】保存完整 R 对象供后续继续分析；RDS 需用 readRDS 读取，不能当 CSV 打开。
   saveRDS(ko, ko_file)
 }
 
@@ -362,6 +420,7 @@ network_results$network_evidence_status <- if (network_interpretable) {
 } else {
   "not_interpretable_zero_STK31_connectivity"
 }
+# 【导出表格】将当前统计或注释写入文件，方便用 Excel 查看；文件名与目录见本次调用。
 write.csv(
   network_results,
   file.path(out_dir, "stk31_network_perturbation.csv"),
@@ -477,6 +536,7 @@ analysis_summary <- data.frame(
 write.csv(analysis_summary, file.path(out_dir, "analysis_summary.csv"), row.names = FALSE)
 
 # 图 1：展示每个样本里 STK31-positive 上皮细胞比例，判断数据基础是否足够。
+# 【ggplot 图层】aes 把表格列映射到坐标/颜色/大小，后面的 + 逐层加入点、线、主题和标签。
 expression_plot <- ggplot(
   sample_summary,
   aes(x = sample, y = pct_stk31_positive, fill = sample)
@@ -497,6 +557,7 @@ write_plot("01_stk31_expression_basis.pdf", expression_plot, 7, 5)
 # 图 2：网络层结果；若 STK31 没有出边，则输出诊断图而不是误导性的扰动排名。
 if (network_interpretable) {
   top_network <- head(network_results[order(-network_results$distance), ], 25)
+  # 【类别顺序】factor 把文本变成类别；levels 控制图表顺序，也可能影响模型参考组。
   top_network$gene <- factor(top_network$gene, levels = rev(top_network$gene))
   network_plot <- ggplot(
     top_network,
@@ -657,5 +718,6 @@ unlink(file.path(out_dir, c(
   "06_stk31_ko_pathway_enrichment.pdf"
 )))
 
+# 【运行记录】记录 R 与已加载包的版本，帮助以后解释同一代码为何可能得到不同结果。
 writeLines(capture.output(sessionInfo()), file.path(out_dir, "sessionInfo.txt"))
 message("STK31 virtual knockout analysis completed: ", out_dir)

@@ -1,4 +1,15 @@
 # -*- coding: utf-8 -*-
+# ========================================================================
+# 【中文阅读指南】从 refined 注释与验证结果拼装导师汇报 PPT
+# 输入：S1–S4 指向细化注释、STK31、CellChat 和样本验证目录；图表来自这些既有结果。
+# 流程：PDF 转图/复用缓存 → 创建宽屏幻灯片 → 按页加入身份、通讯和稳定性证据 → 保存。
+# 输出：results/STK31_NK_mentor_ppt 中的 refined 版 PPTX 与 png_refined 缓存。
+# 图片缺失时部分函数返回 None，CSV 缺失时返回空列表；这些分支用于处理缺少材料的情况。
+# 页面中的人数、日期和结论包含固定文本；数据更新后要核对，不能仅重运行脚本就视为报告已更新。
+# Python 入门：def 定义函数；缩进表示代码归属；字典保存键值对；Path 管理文件路径。
+# 先读顶部输入路径与函数说明，再看文件末尾入口；不要把图中文字当作自动生成的统计结论。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 """Build refined mentor PPT from frozen T/NK labels and refined CellChat results.
 Does NOT overwrite the legacy PPT.
 """
@@ -6,11 +17,13 @@ from pathlib import Path
 import csv
 import subprocess
 
+# 【PPT 工具包】python-pptx 用于创建演示文稿；Inches/Pt 在调用处将常用单位转换为内部长度。
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.util import Inches, Pt
 
+# 【项目根目录】后面的输入输出路径以此为起点；相对脚本定位与写死本机路径的可移植性不同。
 ROOT = Path(r"E:\ZHUWEIYU\Documents\R")
 OUT_DIR = ROOT / "results" / "STK31_NK_mentor_ppt"
 PNG_DIR = OUT_DIR / "png_refined"
@@ -25,6 +38,7 @@ S2 = ROOT / "results" / "merged_stk31_nk_refined_analysis"
 S3 = ROOT / "results" / "merged_cellchat_refined_high_low_nk"
 S4 = ROOT / "results" / "refined_sample_level_validation_v2"
 
+# 【素材清单】字典的键是图片简称、值是 PDF 路径；后面的循环用它定位要插入的图。
 FIGURES = {
     "umap_refined": S1 / "umap_refined_celltype.pdf",
     "dot_tnk": S1 / "dotplot_t_vs_nk_markers.pdf",
@@ -38,11 +52,14 @@ FIGURES = {
 }
 
 
+# 【函数：ensure_dirs】建立输出与 PNG 缓存目录；parents=True 自动建父目录，exist_ok=True 允许目录已存在。
 def ensure_dirs():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     PNG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+# 【函数：pdf_to_png】调用外部 pdftoppm 将 PDF 转为可插入 PPT 的 PNG，并用修改时间判断是否复用缓存。
+# 返回图片路径；缺失输入如何处理取决于当前旧版/refined 版的分支。
 def pdf_to_png(name: str, pdf_path: Path) -> Path | None:
     if not pdf_path.exists():
         print(f"WARN missing figure: {pdf_path}")
@@ -64,6 +81,8 @@ def pdf_to_png(name: str, pdf_path: Path) -> Path | None:
     return png_path if png_path.exists() else None
 
 
+# 【函数：load_csv】把 CSV 的每一行读成字典，列名是键，返回字典列表。
+# utf-8-sig 可兼容带 BOM 的 CSV；字段值通常仍是字符串，计算前要转换。
 def load_csv(path: Path):
     if not path.exists():
         return []
@@ -71,6 +90,8 @@ def load_csv(path: Path):
         return list(csv.DictReader(f))
 
 
+# 【函数：add_textbox】在幻灯片上指定位置建立文本框，设置文字、字号、颜色等。
+# left/top 是位置，width/height 是尺寸；调用处用 Inches，字号用 Pt。
 def add_textbox(slide, text, left, top, width, height, font_size=16, bold=False, color=(30, 30, 30)):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
@@ -87,12 +108,14 @@ def add_textbox(slide, text, left, top, width, height, font_size=16, bold=False,
     return box
 
 
+# 【函数：add_title】统一创建页面标题及可选副标题，使整套 PPT 的标题布局一致。
 def add_title(slide, title, subtitle=None):
     add_textbox(slide, title, Inches(0.4), Inches(0.2), Inches(12.5), Inches(0.45), 22, True, (18, 64, 98))
     if subtitle:
         add_textbox(slide, subtitle, Inches(0.45), Inches(0.65), Inches(12.3), Inches(0.35), 11, False, (90, 90, 90))
 
 
+# 【函数：add_bullets】将 bullets 列表逐项写入文本框的段落，并设置字号和段落布局。
 def add_bullets(slide, bullets, left, top, width, height, font_size=14):
     box = slide.shapes.add_textbox(left, top, width, height)
     tf = box.text_frame
@@ -108,10 +131,14 @@ def add_bullets(slide, bullets, left, top, width, height, font_size=14):
     return box
 
 
+# 【函数：add_note】在页面上添加简短说明文字；本函数实现以实际文本框位置为准。
+# 这是页面上的注解，不应自动理解为 PowerPoint 的演讲者备注区。
 def add_note(slide, text):
     add_textbox(slide, text, Inches(0.45), Inches(6.85), Inches(12.3), Inches(0.3), 10, False, (120, 120, 120))
 
 
+# 【函数：add_image_fit】在给定矩形区域内按图片宽高比放置图片，避免拉伸失真。
+# 图片路径和目标区域由调用处传入。
 def add_image_fit(slide, image_path, left, top, width, height):
     if image_path is None or not Path(image_path).exists():
         add_textbox(slide, "[图缺失]", left, top, width, height, 14, False, (180, 80, 80))
@@ -125,6 +152,8 @@ def add_image_fit(slide, image_path, left, top, width, height):
     return pic
 
 
+# 【函数：add_table】按 rows/headers 建立 PPT 表格，填入单元格并统一格式。
+# 用于展示摘要数值，表格不会自动执行统计分析。
 def add_table(slide, rows, headers, left, top, width, height, font_size=11):
     table = slide.shapes.add_table(len(rows) + 1, len(headers), left, top, width, height).table
     for j, header in enumerate(headers):
@@ -148,16 +177,20 @@ def add_table(slide, rows, headers, left, top, width, height, font_size=11):
     return table
 
 
+# 【函数：build_ppt】主流程：准备素材，创建宽屏演示文稿，按顺序加页面并保存 PPTX。
+# 函数内的页面标题、说明和部分数字是固定文本；换分析结果后应一起核对。
 def build_ppt():
     ensure_dirs()
     imgs = {k: pdf_to_png(k, p) for k, p in FIGURES.items()}
 
+    # 【创建幻灯片文件】新建空白演示文稿；下面设置页面宽高，再使用空白版式逐页排版。
     prs = Presentation()
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
     blank = prs.slide_layouts[6]
 
     # 1 title
+    # 【添加一页】每次调用新建一张幻灯片；后面的 add_title/add_image_fit 等都写到这一页。
     s = prs.slides.add_slide(blank)
     add_title(s, "STK31 与 NK 候选互作：refined 标签版汇报", "胆囊癌 scRNA-seq | 冻结 analysis_celltype | 2026-07-17")
     add_bullets(
@@ -359,10 +392,12 @@ def build_ppt():
         16,
     )
 
+    # 【保存 PPTX】把内存中的演示文稿写入目标文件；同名文件会被本次内容更新。
     prs.save(PPTX_PATH)
     print(f"Wrote {PPTX_PATH}")
     return PPTX_PATH
 
 
+# 【脚本入口】直接运行本文件时执行下面的主函数；作为模块导入时不自动执行这段入口。
 if __name__ == "__main__":
     build_ppt()

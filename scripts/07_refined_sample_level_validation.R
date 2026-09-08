@@ -1,3 +1,18 @@
+# ========================================================================
+# 【中文阅读指南】以样本为单位检查候选通讯的稳定性
+# 输入：脚本 06 的 refined_merged_object.rds；沿用已经确定的细胞身份，不再次修改注释。
+# 流程：每个样本分别统计高/低上皮和 NK → 按发送/接收方向评分 → 留一验证 → 细胞重采样 → 分组敏感性。
+# 输出：默认 results/refined_sample_level_validation_v2，含各样本候选轴汇总及验证表。
+# 这里的独立生物学单位是样本（本项目 n=4）；几千个细胞不等于几千个独立患者。
+# 样本内 bootstrap 反映所采细胞的波动，不增加样本数；LOSO 检查去掉一个样本后结论是否改变。
+# 基因在矩阵行名中存在，不代表在当前细胞群检测到；代码分别记录 genes_present 与 genes_detected。
+# 此处的模块乘积是描述性候选分数，不能作为 CellChat 通讯概率解释。
+# 阅读顺序：文件开头的路径/参数 → 工具函数 → 主流程；函数定义本身不会执行分析。
+# R 入门：<- 是赋值；$ 取一列/一个成员；[行,列] 取子集；c() 建向量；list() 装不同类型对象。
+# NA 表示缺失，不等于 0；counts 是原始计数，data 通常是 log 标准化表达。
+# 运行环境：本项目默认在 Linux 服务器 /home/zhuweiyu/codex-r 下用 Rscript 运行。
+# 本次中文注释用于解释现有实现；原有计算语句、参数、输出名称保持不变。
+# ========================================================================
 # ============================================================
 # 07_refined_sample_level_validation.R  (method-revised v2)
 # Sample-level exploratory validation using FROZEN refined labels.
@@ -13,36 +28,48 @@
 # Default output: results/refined_sample_level_validation_v2/
 # ============================================================
 
+# 【加载依赖】library 加载本脚本用到的包；外层只隐藏启动提示，不会安装缺失的包。
 suppressPackageStartupMessages({
   library(Seurat)
   library(Matrix)
   library(ggplot2)
 })
 
+# 【可重复性】固定随机数起点，使同一环境下的抽样/随机算法更易复现；不同包版本仍可能产生差异。
 set.seed(20260717)
 
 project_dir <- "/home/zhuweiyu/codex-r"
 input_rds <- file.path(
   project_dir, "results/merged_tnk_refined_annotation/refined_merged_object.rds"
 )
+# 【可调参数】Sys.getenv 先读环境变量，未设置时使用代码中的默认值；as.integer/as.numeric 把文本转为数值。
 out_dir <- Sys.getenv(
   "STK31_SAMPLE_VAL_OUT",
   file.path(project_dir, "results/refined_sample_level_validation_v2")
 )
+# 【输出目录】recursive=TRUE 可连同父目录一起建立；路径变量决定结果实际写到哪里。
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
 target_gene <- "STK31"
 epi_label <- "Epithelial"
+# 【参数 n_boot】样本内细胞重采样的重复次数，控制稳定性估计的计算量。
 n_boot <- as.integer(Sys.getenv("STK31_SAMPLE_BOOT", "200"))
+# 【参数 min_high_cells】每样本 high 组的最低细胞数，用于判定该样本是否可评价。
 min_high_cells <- 3
+# 【参数 min_nk_cells】每样本 NK 的最低细胞数；数量不足时不应强行给出比较方向。
 min_nk_cells <- 10
+# 【参数 min_low_cells】每样本 low 组的最低细胞数，与 high/NK 门槛共同决定可评价性。
 min_low_cells <- 20
 # Detection thresholds (explicit)
+# 【参数 min_mean_expr】判定基因实际检出时使用的平均表达下限，需与比例条件一起看。
 min_mean_expr <- 0
+# 【参数 min_pct_expr】实际检出所需的最低阳性细胞比例；0.01 表示 1%。
 min_pct_expr <- 0.01
+# 【参数 similar_abs】high-low 绝对差小于此阈值标记相近；这是描述性门槛，不是 P 值。
 similar_abs <- 0.02
 
 # Direction-aware axes (sender / receiver)
+# 【候选轴及方向】ligands 在发送细胞评分，receptors 在接收细胞评分；同一路径反向需另算。
 axes <- list(
   "MHC-I/HLA_epi_to_NK" = list(
     sender = "epithelial", receiver = "NK",
@@ -76,12 +103,18 @@ axes <- list(
   )
 )
 
+# 【函数：stop_if_missing】先检查输入文件是否存在；缺失时立刻 stop，避免下游产生误导性结果。
 stop_if_missing <- function(path) {
   if (!file.exists(path)) stop("Missing file: ", path)
 }
 
+# 【函数：available_genes】把想看的基因与对象实际行名取交集，避免访问不存在的基因。
+# 返回基因名向量；返回长度为零表示这些基因不在当前矩阵内。
+# 【集合交集】intersect 只保留两份名单共有的元素，常用于筛选当前数据真正有的基因/细胞。
 available_genes <- function(object, genes) intersect(genes, rownames(object))
 
+# 【函数：fetch_mat】提取当前 assay 中指定基因的矩阵，并兼容 Seurat 的 layer/slot 差异。
+# drop=FALSE 保留二维结构，防止只取一个基因时自动变成向量。
 fetch_mat <- function(object, genes, slot = "data") {
   genes <- available_genes(object, genes)
   if (length(genes) == 0) return(NULL)
@@ -92,6 +125,8 @@ fetch_mat <- function(object, genes, slot = "data") {
   }
 }
 
+# 【函数：module_score_cells】在指定细胞中计算模块均值、阳性比例及每个基因的检测情况。
+# genes_present 只表示矩阵有这一行；genes_detected 还需要满足表达和比例阈值。
 module_score_cells <- function(object, genes, cells) {
   genes_present <- available_genes(object, genes)
   if (length(genes_present) == 0 || length(cells) == 0) {
@@ -109,6 +144,7 @@ module_score_cells <- function(object, genes, cells) {
     ))
   }
   # per-gene detection in these cells
+  # 【按基因求均值】在基因×细胞矩阵中，rowMeans 对每一行跨细胞求平均；若输入是 >0 的逻辑矩阵，得到检出比例。
   gene_mean <- as.numeric(Matrix::rowMeans(mat))
   gene_pct <- as.numeric(Matrix::rowMeans(mat > 0))
   names(gene_mean) <- genes_present
@@ -116,6 +152,7 @@ module_score_cells <- function(object, genes, cells) {
   detected <- genes_present[
     (gene_mean > min_mean_expr) & (gene_pct >= min_pct_expr)
   ]
+  # 【按细胞求均值】在基因×细胞矩阵中，colMeans 对每列跨基因求平均，常用来构建逐细胞模块分数。
   cell_score <- as.numeric(Matrix::colMeans(mat))
   list(
     mean_expr = mean(cell_score),
@@ -128,6 +165,8 @@ module_score_cells <- function(object, genes, cells) {
   )
 }
 
+# 【函数：is_detected_module】综合可用基因、实际检出基因和模块数值，判断该模块能否作为检测到的信号。
+# 请同时查看基因级阈值；这里包含或条件，不能简单理解成所有指标都超过同一阈值。
 is_detected_module <- function(mod) {
   if (is.null(mod) || length(mod$genes_present) == 0) return(FALSE)
   if (!is.finite(mod$mean_expr) || !is.finite(mod$pct_pos)) return(FALSE)
@@ -137,6 +176,8 @@ is_detected_module <- function(mod) {
     (mod$pct_pos >= min_pct_expr || mod$mean_expr > 0)
 }
 
+# 【函数：label_direction】根据 high-low 差值标记方向；绝对差小于 similar_abs 记为 similar。
+# 非有限值记 insufficient，表示不能评价；方向标签本身不提供统计显著性。
 label_direction <- function(delta) {
   if (!is.finite(delta)) return("insufficient")
   if (abs(delta) < similar_abs) return("similar")
@@ -144,6 +185,7 @@ label_direction <- function(delta) {
   "higher_in_low"
 }
 
+# 【函数：write_session】将会话版本与验证配置写入文件，供之后核对计算环境。
 write_session <- function(path) {
   sink(path)
   cat("timestamp:", as.character(Sys.time()), "\n")
@@ -157,6 +199,7 @@ write_session <- function(path) {
   cat("NOTE: statistical unit is sample (n=4).\n")
   cat("Bootstrap unit: cells within each sample (NOT independent samples).\n")
   cat("evidence_level must NOT be upgraded by within-sample bootstrap.\n")
+  # 【运行记录】记录 R 与已加载包的版本，帮助以后解释同一代码为何可能得到不同结果。
   print(sessionInfo())
   sink()
 }
@@ -167,9 +210,11 @@ write_session(file.path(out_dir, "sessionInfo.txt"))
 stop_if_missing(input_rds)
 
 message("Loading frozen refined object")
+# 【读取中间对象】readRDS 恢复之前保存的 R 对象；检查文件路径和对象来自哪一版注释。
 obj <- readRDS(input_rds)
 DefaultAssay(obj) <- "RNA"
 if (utils::packageVersion("SeuratObject") >= "5.0.0") {
+  # 【Seurat v5 数据层】将拆分的数据层合并以供下游读取；这不是批次校正，也不是重新聚类。
   try(obj <- JoinLayers(obj, assay = "RNA"), silent = TRUE)
 }
 
@@ -183,6 +228,7 @@ n_nk <- sum(obj$is_refined_nk)
 message("Refined NK: ", n_nk)
 
 stk31_data <- as.numeric(fetch_mat(obj, target_gene, "data")[target_gene, ])
+# 【错误分支】尝试运行代码，失败时进入 error 函数；应阅读返回值，区分正常结果与跳过/失败说明。
 stk31_counts <- tryCatch(
   as.numeric(fetch_mat(obj, target_gene, "counts")[target_gene, ]),
   error = function(e) stk31_data
@@ -201,7 +247,9 @@ epi_low_primary <- is_epi & !epi_high_primary
 samples <- sort(unique(as.character(obj$sample)))
 message("Samples: ", paste(samples, collapse = ", "))
 
+# 【分组数量】逐样本统计 high、low 和 NK 数，先判断样本能否满足后续比较的最低数量。
 # ---------- group counts ----------
+# 【批量处理】lapply 对向量/列表的每个元素执行一次函数，返回列表；rbind/do.call 可再把结果按行拼表。
 group_counts <- do.call(rbind, lapply(samples, function(s) {
   idx <- obj$sample == s
   n_high <- sum(idx & epi_high_primary)
@@ -223,8 +271,10 @@ group_counts <- do.call(rbind, lapply(samples, function(s) {
     stringsAsFactors = FALSE
   )
 }))
+# 【导出表格】将当前统计或注释写入文件，方便用 Excel 查看；文件名与目录见本次调用。
 write.csv(group_counts, file.path(out_dir, "sample_level_group_counts.csv"), row.names = FALSE)
 
+# 【样本内计算】每个样本单独取 high/low 上皮和 NK，避免先混合全部细胞后丢掉样本差异。
 # ---------- axis scoring with direction ----------
 axis_rows <- list()
 effect_rows <- list()
@@ -251,8 +301,10 @@ for (axis_name in names(axes)) {
     n_nk_s <- length(nk_cells)
     cell_ok <- group_counts$evaluable_for_high_low[group_counts$sample == s]
 
+    # 【按方向取表达】上皮→NK 与 NK→上皮使用不同端的配体/受体，避免把发送接收颠倒。
     # Compute sender/receiver modules by direction
     if (sender == "epithelial" && receiver == "NK") {
+      # 【上皮发送】分别计算 high/low 上皮配体分数，并与同一样本的 NK 受体分数组合。
       # compare high vs low epithelial ligand; * NK receptor
       high_lig <- module_score_cells(obj, lig, high_cells)
       low_lig <- module_score_cells(obj, lig, low_cells)
@@ -304,6 +356,7 @@ for (axis_name in names(axes)) {
       }
 
     } else if (sender == "NK" && receiver == "epithelial") {
+      # 【NK 发送】NK 配体分数共用，比较 high/low 上皮中的受体分数。
       # NK ligand common; compare high vs low epithelial receptor
       nk_lig <- module_score_cells(obj, lig, nk_cells)
       high_rec <- module_score_cells(obj, rec, high_cells)
@@ -406,6 +459,7 @@ effect_df <- do.call(rbind, effect_rows)
 write.csv(axis_df, file.path(out_dir, "sample_level_candidate_axis_summary.csv"), row.names = FALSE)
 write.csv(effect_df, file.path(out_dir, "sample_level_high_low_effect_directions.csv"), row.names = FALSE)
 
+# 【留一法】每次排除一个样本，重新看其余样本的多数方向；检验结论是否被某一例主导。
 # ---------- LOSO ----------
 # Full-sample majority among directional labels excluding insufficient/not_detected for majority of "comparable" dirs
 loso_rows <- list()
@@ -460,9 +514,11 @@ for (axis_name in names(axes)) {
 loso_df <- do.call(rbind, loso_rows)
 write.csv(loso_df, file.path(out_dir, "leave_one_sample_out_summary.csv"), row.names = FALSE)
 
+# 【细胞重采样】在每个样本内部有放回抽细胞，观察估计波动；这不会产生新的独立患者。
 # ---------- within-sample cell bootstrap (fast: pre-extract cell scores) ----------
 message("Running descriptive within-sample cell bootstrap (n=", n_boot, ")")
 
+# 【缓存分数】先计算各基因集合的逐细胞均值，bootstrap 时直接抽分数，减少重复读大矩阵。
 # Precompute per-cell module scores for all unique gene sets
 all_gene_sets <- unique(unlist(lapply(axes, function(a) list(
   paste(sort(a$ligands), collapse = "|"),
@@ -470,6 +526,7 @@ all_gene_sets <- unique(unlist(lapply(axes, function(a) list(
 ))))
 # map gene-set key -> named numeric vector of cell scores
 cell_score_cache <- list()
+# 【函数：get_cell_scores】从预先缓存的基因集合分数取逐细胞向量，减少 bootstrap 中重复提取矩阵的成本。
 get_cell_scores <- function(genes) {
   key <- paste(sort(available_genes(obj, genes)), collapse = "|")
   if (!nzchar(key)) return(setNames(rep(NA_real_, ncol(obj)), colnames(obj)))
@@ -481,6 +538,7 @@ get_cell_scores <- function(genes) {
   sc
 }
 
+# 【函数：detect_from_scores】依据当前抽样后的分数判断是否达到检测条件，供重采样循环使用。
 detect_from_scores <- function(scores) {
   if (length(scores) == 0 || all(!is.finite(scores))) return(FALSE)
   mean_s <- mean(scores, na.rm = TRUE)
@@ -613,7 +671,9 @@ write.csv(
   row.names = FALSE
 )
 
+# 【定义敏感性】比较 counts>0、全体上皮 q75、每样本上皮 q75 三种集合；集合完全相同不构成独立重复验证。
 # ---------- STK31 definition sensitivity with set identity ----------
+# 【三种定义】原始 counts>0、全体上皮 q75、逐样本上皮 q75；后面用集合重叠检验是否真有不同。
 # three definitions of high cells
 def1_cells <- colnames(obj)[is_epi & stk31_counts > 0]
 q_global <- as.numeric(stats::quantile(stk31_data[is_epi], 0.75, na.rm = TRUE))
@@ -639,6 +699,8 @@ for (s in samples) {
 }
 def3_cells <- unique(def3_cells)
 
+# 【函数：jaccard】计算两个细胞集合的交集大小/并集大小，衡量分组定义的重合程度。
+# 1 表示集合相同，0 表示没有交集；两个集合都为空时返回 NA。
 jaccard <- function(a, b) {
   if (length(union(a, b)) == 0) return(NA_real_)
   length(intersect(a, b)) / length(union(a, b))
@@ -718,6 +780,7 @@ sens_out <- rbind(
 )
 write.csv(sens_out, file.path(out_dir, "stk31_definition_sample_level_sensitivity.csv"), row.names = FALSE)
 
+# 【证据汇总】把检出、可评价样本数、方向一致性和留一稳定性放在一起解读。
 # ---------- validation summary per axis ----------
 summary_rows <- list()
 for (axis_name in names(axes)) {
@@ -755,6 +818,7 @@ for (axis_name in names(axes)) {
     boot_cons <- "no_samples_stable"
   }
 
+  # 【证据等级】bootstrap 的稳定并不能弥补只有少量独立样本的限制，不能据此升级机制证据。
   # evidence_level: MUST NOT upgrade based on bootstrap
   if (n_nd == nrow(sub) || (n_eval_dir == 0 && n_nd > 0 && n_ins == 0)) {
     evidence <- "not_detected"
@@ -808,6 +872,7 @@ pdf(file.path(out_dir, "sample_level_candidate_axis_plot.pdf"), width = 12, heig
 plot_df <- axis_df
 plot_df$delta_plot <- plot_df$delta_interaction_high_minus_low
 plot_df$delta_plot[plot_df$direction %in% c("not_detected", "insufficient")] <- NA
+# 【ggplot 图层】aes 把表格列映射到坐标/颜色/大小，后面的 + 逐层加入点、线、主题和标签。
 p1 <- ggplot(plot_df, aes(x = sample, y = delta_plot, fill = direction)) +
   geom_col(na.rm = TRUE) +
   facet_wrap(~axis, scales = "free_y") +
@@ -838,6 +903,7 @@ p2 <- ggplot(
 print(p2)
 dev.off()
 
+# 【解读边界】将样本量、表达检测及观察性推断等限制随结果保存，便于写报告时准确引用。
 # ---------- limitations ----------
 lim <- c(
   "# Sample-level validation limitations (v2 method revision)",
